@@ -1,2 +1,14 @@
 nimble.develop
 nimble.paths
+
+# Build output
+build/
+nimcache/
+tests/generated/
+
+# Compiled test and example binaries (Nim drops them next to the source)
+tests/test_*
+!tests/test_*.nim
+examples/tiny_cnn
+!examples/*.nim
+*.exe
