@@ -1,11 +1,13 @@
 nimble.develop
 nimble.paths
 
-# Build output
+# Build output. The `steadyc` binary is dropped at the repo root, so anchor the
+# pattern: an unanchored `steadyc` also matches the src/steadyc/ package
+# directory and silently untracks every module in it.
 build/
 nimcache/
 tests/generated/
-steadyc
+/steadyc
 
 # Fetched model fixtures and the reference interpreter. Both are optional and
 # reproducible: tests/models/fetch.sh pins a checksum for every file, and the

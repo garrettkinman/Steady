@@ -7,7 +7,7 @@
 
 version       = "0.1.0"
 author        = "Garrett Kinman"
-description   = "A production TinyML inference compiler and runtime in pure Nim, for microcontrollers."
+description   = "An ahead-of-time TinyML inference compiler and runtime in pure Nim, for microcontrollers."
 license       = "MIT"
 srcDir        = "src"
 installExt    = @["nim"]
