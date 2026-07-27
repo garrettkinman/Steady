@@ -104,4 +104,6 @@ when isMainModule:
   echo p.report([g])
 
   emitModel(g, p, outDir, "tiny_cnn")
-  echo &"wrote {outDir}/tiny_cnn.nim, tiny_cnn_weights.c, tiny_cnn_weights.h"
+  emitCApi(g, p, outDir, "tiny_cnn")
+  echo &"wrote {outDir}/tiny_cnn.nim, tiny_cnn_weights.c, tiny_cnn_weights.h, " &
+       &"tiny_cnn_api.nim, tiny_cnn.h"

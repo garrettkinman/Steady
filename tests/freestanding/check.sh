@@ -48,6 +48,7 @@ cd "$BUILD"
 CFLAGS="-c -Os -ffreestanding -ffunction-sections -fdata-sections -mcpu=cortex-m4 -mthumb -w -I$NIMLIB"
 for f in *.c; do arm-none-eabi-gcc $CFLAGS -o "${f%.c}.o" "$f"; done
 arm-none-eabi-gcc $CFLAGS -o weights.o "$ROOT/tests/generated/tiny_cnn_weights.c"
+arm-none-eabi-gcc $CFLAGS -o weights_branch.o "$ROOT/tests/generated/branch_net_weights.c"
 
 cat > root.c <<'EOF'
 /* Roots for --gc-sections: without these the linker would discard the
@@ -57,15 +58,21 @@ extern void steady_model_invoke(void);
 extern signed char *steady_model_input(void);
 extern signed char *steady_model_output(void);
 extern int steady_arena_size(void);
+extern void steady_branch_invoke(void);
+extern signed char *steady_branch_input(void);
+extern signed char *steady_branch_output(void);
+extern int steady_branch_arena_size(void);
 void _start(void) {
   steady_selftest(); steady_model_invoke();
   steady_model_input(); steady_model_output(); steady_arena_size();
+  steady_branch_invoke();
+  steady_branch_input(); steady_branch_output(); steady_branch_arena_size();
   for (;;) { }
 }
 EOF
 arm-none-eabi-gcc $CFLAGS -o root.o root.c
 
-arm-none-eabi-gcc -o image.elf root.o ./@m*.o ./@p*.o weights.o \
+arm-none-eabi-gcc -o image.elf root.o ./@m*.o ./@p*.o weights.o weights_branch.o \
   -mcpu=cortex-m4 -mthumb -nostartfiles -Wl,--gc-sections -Wl,-e,_start \
   -Wl,-Ttext=0x08000000 -Wl,-Tbss=0x20000000 \
   --specs=nosys.specs --specs=nano.specs -Wl,-Map=image.map
@@ -89,6 +96,17 @@ if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_w_"; then
   exit 1
 fi
 echo "    weights in flash (.rodata)"
+# Activation tables are constants too, and are just as expensive to get wrong:
+# a 256-entry table copied into RAM at startup is 256 bytes of SRAM for nothing.
+if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_lut"; then
+  echo "FAIL: activation tables are not in .rodata"
+  exit 1
+fi
+if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_exp"; then
+  echo "FAIL: the softmax exp table is not in .rodata"
+  exit 1
+fi
+echo "    activation and exp tables in flash (.rodata)"
 if ! arm-none-eabi-nm image.elf | grep -qE "^2000.* B arena"; then
   echo "FAIL: arena is not in .bss"
   exit 1

@@ -279,3 +279,226 @@ proc copy1d*[P, S](
     assert S is Store(P), "copy1d: storage type mismatch"
   for i in 0 ..< n:
     y[i] = x[i]
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# PAD  (NHWC, spatial only, batch 1)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc pad2d*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    inH, inW, channels: int,
+    padTop, padBottom, padLeft, padRight: int,
+    padValue: S) =
+  ## Writes the output in address order: whole padded rows, then per row a
+  ## left border, the input run, and a right border. The output is written
+  ## exactly once and read never, so there is no interior bounds test.
+  ##
+  ## `padValue` is in Store units and comes from the host, which quantizes the
+  ## op's real pad constant — for affine int8 that is the zero point when the
+  ## constant is 0.0, which is what TFLite's PAD means and a place it is easy
+  ## to accidentally write an integer zero instead.
+  static:
+    assert S is Store(P), "pad2d: storage type mismatch"
+
+  let outW = padLeft + inW + padRight
+  let rowLen = outW * channels
+  let runLen = inW * channels
+  var o = 0
+  for _ in 0 ..< padTop * rowLen:
+    y[o] = padValue
+    inc o
+  for iy in 0 ..< inH:
+    for _ in 0 ..< padLeft * channels:
+      y[o] = padValue
+      inc o
+    let xBase = iy * runLen
+    for i in 0 ..< runLen:
+      y[o] = x[xBase + i]
+      inc o
+    for _ in 0 ..< padRight * channels:
+      y[o] = padValue
+      inc o
+  for _ in 0 ..< padBottom * rowLen:
+    y[o] = padValue
+    inc o
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# CONCATENATION
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# There is no whole-op concatenation kernel. Concatenation is a set of writes
+# into disjoint slices of one output buffer, and the host knows every slice
+# offset at compile time, so it emits one call per operand and no operand ever
+# learns that the others exist.
+#
+# `outer` is the product of the dimensions before the concat axis — identical
+# for every operand, since those dimensions must agree. `innerIn` is the
+# product from the axis onward for this operand, `innerOut` the same for the
+# output. Both degenerate to a single flat copy when the axis is the outermost
+# non-trivial one.
+
+proc concatSlice*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    outer, innerIn, innerOut, dstOffset: int) =
+  ## Verbatim copy, emitted when the operand already carries the output's
+  ## quantization — the overwhelmingly common case, and exact.
+  static:
+    assert S is Store(P), "concatSlice: storage type mismatch"
+  for o in 0 ..< outer:
+    let src = o * innerIn
+    let dst = o * innerOut + dstOffset
+    for i in 0 ..< innerIn:
+      y[dst + i] = x[src + i]
+
+proc concatSliceRescaled*[P, S, PT](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    prm: PT,
+    outer, innerIn, innerOut, dstOffset: int,
+    mult, shift, offset: int32) =
+  ## Same copy, for an operand whose quantization differs from the output's.
+  ## This is deliberately the *add* kernel's rescale path with one operand
+  ## instead of two: same primitive, same two-stage multiplier, already
+  ## covered by the same tests. For real policies the rescale parameters are
+  ## ignored and this reduces to the copy above.
+  static:
+    assert S is Store(P), "concatSliceRescaled: storage type mismatch"
+    assert PT is Params(P), "concatSliceRescaled: params type mismatch"
+  for o in 0 ..< outer:
+    let src = o * innerIn
+    let dst = o * innerOut + dstOffset
+    for i in 0 ..< innerIn:
+      var acc = zeroAccum(P)
+      addRescaled(P, acc, x[src + i], mult, shift, offset)
+      y[dst + i] = finish(P, acc, prm, 0)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# MEAN  (reduction over H and W — global average)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc meanSpatial*[P, S, B, PT](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    corr: B,
+    prm: PT,
+    inH, inW, channels: int) =
+  ## y[c] = finish(mean over all pixels of x[.., c])
+  ##
+  ## `corr` carries the zero-point correction in accumulator units, exactly as
+  ## a folded bias does: for affine int8 the host passes `-count * Zx`, so
+  ## `divAccum` sees `sum(x - Zx)` and the kernel again never learns what a
+  ## zero point is. For real policies it is zero and the whole op is a plain
+  ## average.
+  ##
+  ## `meanScale` is where the division goes, and what it does depends on the
+  ## policy: for affine it is the identity, because the host has folded
+  ## `1/count` into the output multiplier so that the reduction rounds exactly
+  ## once; for a real format, which has no multiplier to fold into, it divides.
+  ## One kernel, a mean under every policy, and no rounding of the accumulator
+  ## before `finish` sees it — which is worth a full LSB on a global average
+  ## pool, as MobileNetV2 demonstrated.
+  ##
+  ## Channels are the outer loop because the alternative needs one accumulator
+  ## per channel, and a variable-length accumulator array is precisely the
+  ## dynamic allocation this runtime does not do.
+  static:
+    assert S is Store(P), "meanSpatial: storage type mismatch"
+    assert B is Bias(P), "meanSpatial: correction type mismatch"
+    assert PT is Params(P), "meanSpatial: params type mismatch"
+
+  let count = inH * inW
+  for c in 0 ..< channels:
+    var acc = zeroAccum(P)
+    for i in 0 ..< count:
+      accumulate(P, acc, x[i * channels + c])
+    addBias(P, acc, corr)
+    y[c] = finish(P, meanScale(P, acc, count), prm, 0)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# LOOKUP-TABLE ACTIVATIONS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc lut1d*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    n: int,
+    table: ptr UncheckedArray[S]) =
+  ## Every non-linear activation on an 8-bit storage type, for the price of
+  ## one load: the host evaluated the true function at each of the 256
+  ## representable inputs and quantized the result. Exact by construction,
+  ## constant-time, and it needs no arithmetic — no libm, no software float, no
+  ## fixed-point series expansion.
+  ##
+  ## Safe to run in place. Only instantiates for policies that define
+  ## `lutIndex`, which is the compile-time expression of "this storage type
+  ## has 256 values".
+  static:
+    assert S is Store(P), "lut1d: storage type mismatch"
+  for i in 0 ..< n:
+    y[i] = table[lutIndex(P, x[i])]
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# SOFTMAX
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc softmax*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    rows, classes: int,
+    expLut: ptr UncheckedArray[int32],
+    outMult, outShift, outZeroPoint, actMin, actMax: int32) =
+  ## Softmax over the last axis, from a host-generated exp table.
+  ##
+  ## `rows` is the product of every dimension before the last, so one call
+  ## covers both a classifier's single vector and a detector's grid of
+  ## per-cell distributions — FOMO's output is a 12x12 grid of them. Each row
+  ## normalises independently; the table is shared, since it depends only on
+  ## the input scale.
+  ##
+  ## The table is keyed on the *difference* `max - x[i]`, which for a uniform
+  ## integer store is itself an index in `0 ..< 256`. That is what makes the
+  ## table possible: subtracting the max is required for numerical range, and
+  ## only a uniform integer domain keeps the subtracted value enumerable. A
+  ## non-uniform format (fp8, posits) has no such index, so this op is affine
+  ## only and the host rejects it elsewhere rather than the kernel branching.
+  ##
+  ## Entry `d` holds `exp(-d * inScale) * 2^expBits`, with `expBits` chosen by
+  ## the host from the class count so the sum cannot overflow an int32. The
+  ## normalising divide is done once per element in Q15; the 64-bit numerator
+  ## is the only wide arithmetic on the target, and softmax runs once per
+  ## inference over a handful of classes.
+  ##
+  ## Safe to run in place: the max and the total are complete before anything
+  ## is written, and the final pass reads `x[i]` only to write `y[i]`.
+  static:
+    assert S is Store(P), "softmax: storage type mismatch"
+    assert P is AffineI8,
+      "softmax needs a uniform integer store domain; the host rejects this " &
+      "op for real-number policies rather than approximating it here"
+
+  for r in 0 ..< rows:
+    let base = r * classes
+
+    var mx = int(x[base])
+    for i in 1 ..< classes:
+      let v = int(x[base + i])
+      if v > mx: mx = v
+
+    var total = 0'i32
+    for i in 0 ..< classes:
+      total += expLut[mx - int(x[base + i])]
+
+    for i in 0 ..< classes:
+      let e = expLut[mx - int(x[base + i])]
+      let p = int32((int64(e) shl 15) div int64(total))
+      var q = multiplyByQuantizedMultiplier(p, outMult, outShift) + outZeroPoint
+      if q < actMin: q = actMin
+      if q > actMax: q = actMax
+      y[base + i] = S(q)

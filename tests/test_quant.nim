@@ -63,6 +63,33 @@ suite "RoundingDivideByPOT":
     for x in [0'i32, 1, -1, 12345, -12345, high(int32), low(int32)]:
       check roundingDivideByPOT(x, 0'i32) == x
 
+  test "the largest exponent quantizeMultiplier can produce is handled":
+    # `quantizeMultiplier` clamps its shift at -31, so exponent 31 is
+    # reachable, and a mask built as `1'i32 shl 31` overflows an int32 —
+    # gemmlowp writes `1ll << exponent` for exactly this reason. A convolution
+    # channel whose weights are all but zero gets a multiplier this small, so
+    # this is a case real models reach, not a synthetic edge.
+    for exponent in 1'i32 .. 31'i32:
+      let half = 1'i64 shl (exponent - 1)
+      # Values chosen relative to the divisor: just under, exactly, just over
+      # the halfway point, in both signs.
+      for delta in [-1'i64, 0'i64, 1'i64]:
+        let x = int32(min(half + delta, int64(high(int32))))
+        let want = int32((int64(x) + half) div (1'i64 shl exponent))
+        check roundingDivideByPOT(x, exponent) == want
+        if x != low(int32):
+          let neg = -x
+          let wantNeg = -int32((int64(x) + half) div (1'i64 shl exponent))
+          check roundingDivideByPOT(neg, exponent) == wantNeg
+
+  test "a multiplier small enough to clamp the shift still requantizes":
+    # End to end: an effective scale this small is what a dead channel looks
+    # like, and it must produce zero rather than trapping or wrapping.
+    let (m, s) = quantizeMultiplier(pow(2.0, -31.0))
+    check s >= -31'i32
+    for x in [0'i32, 1, -1, 1000, -1000, high(int32), low(int32) + 1]:
+      discard multiplyByQuantizedMultiplier(x, m, s)   # must not trap
+
   test "is not a bare arithmetic shift":
     # An arithmetic shift floors; this rounds. The two agree on exact
     # values and on ties that happen to floor the same way, so the

@@ -120,6 +120,31 @@ suite "arena planner":
       if r.offset == outOff and r.size == 64: outRange = r
     check outRange.last >= g.ops.len
 
+  test "an input buffer stops being live after its last read":
+    # This is a deliberate contract, not an accident, and it is worth pinning:
+    # an input's bytes are reusable the moment the model has read them, which
+    # is why the emitted accessors and the C header both say to refill every
+    # input before every invoke. Relaxing it would cost RAM on exactly the
+    # models where the input is the largest buffer.
+    let g = chainGraph(@[256, 8, 8, 8])
+    let alias = resolveAliases(g)
+    let ranges = computeLiveRanges(g, alias)
+    var inputRange: LiveRange
+    for r in ranges:
+      if g.tensors[r.tensor].kind == tkInput: inputRange = r
+    check inputRange.last == 0                # read by op 0, dead after it
+    check inputRange.last < g.ops.len
+
+    # And the planner does put something else there, on a graph shaped to make
+    # that worthwhile.
+    let p = planOne(g)
+    let inputOffset = p.offsets[inputRange.tensor]
+    var sharesWithInput = false
+    for r in p.ranges:
+      if r.tensor != inputRange.tensor and r.offset == inputOffset:
+        sharesWithInput = true
+    check sharesWithInput
+
   test "report states peak RAM and flash":
     let g = chainGraph(@[64, 256])
     let r = planOne(g).report([g])

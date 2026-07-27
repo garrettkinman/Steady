@@ -16,6 +16,7 @@
 
 import steady
 import ../generated/tiny_cnn as model
+import ../generated/branch_net as branch
 
 var mult = [1073741824'i32]
 var shift = [0'i32]
@@ -49,3 +50,22 @@ proc steady_model_output(): ptr UncheckedArray[int8] {.exportc, cdecl.} =
 
 proc steady_arena_size(): int32 {.exportc, cdecl.} =
   int32(model.ArenaSize)
+
+# The second model is here for the ops the first one does not have: padding,
+# concatenation, a spatial mean, a table activation, and a softmax whose
+# normalising divide is the only 64-bit arithmetic on the target. If any of
+# that quietly wanted libm, a float printf or an allocator, this is where it
+# shows up — and the placement audit checks that its tables went to flash
+# rather than being copied into RAM at startup.
+
+proc steady_branch_invoke() {.exportc, cdecl.} =
+  branch.invoke()
+
+proc steady_branch_input(): ptr UncheckedArray[int8] {.exportc, cdecl.} =
+  branch.input0()
+
+proc steady_branch_output(): ptr UncheckedArray[int8] {.exportc, cdecl.} =
+  branch.output0()
+
+proc steady_branch_arena_size(): int32 {.exportc, cdecl.} =
+  int32(branch.ArenaSize)

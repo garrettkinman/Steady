@@ -5,10 +5,18 @@ nimble.paths
 build/
 nimcache/
 tests/generated/
+steadyc
+
+# Fetched model fixtures and the reference interpreter. Both are optional and
+# reproducible: tests/models/fetch.sh pins a checksum for every file, and the
+# venv holds nothing but ai-edge-litert.
+tests/models/*.tflite
+.venv/
 
 # Compiled test and example binaries (Nim drops them next to the source)
 tests/test_*
 !tests/test_*.nim
 examples/tiny_cnn
+examples/branch_net
 !examples/*.nim
 *.exe

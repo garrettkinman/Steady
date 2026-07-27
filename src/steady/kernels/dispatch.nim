@@ -110,3 +110,42 @@ template addElementwise*(P: typedesc, y, a, b, prm, n: untyped,
 template copy1d*(P: typedesc, y, x, n: untyped) =
   dispatch(steady_backend.copy1d(P, y, x, n),
            reference.copy1d(P, y, x, n))
+
+template pad2d*(P: typedesc, y, x: untyped,
+                inH, inW, channels, padTop, padBottom, padLeft, padRight,
+                padValue: untyped) =
+  dispatch(steady_backend.pad2d(P, y, x, inH, inW, channels,
+                                padTop, padBottom, padLeft, padRight, padValue),
+           reference.pad2d(P, y, x, inH, inW, channels,
+                           padTop, padBottom, padLeft, padRight, padValue))
+
+template concatSlice*(P: typedesc, y, x: untyped,
+                      outer, innerIn, innerOut, dstOffset: untyped) =
+  dispatch(steady_backend.concatSlice(P, y, x, outer, innerIn, innerOut, dstOffset),
+           reference.concatSlice(P, y, x, outer, innerIn, innerOut, dstOffset))
+
+template concatSliceRescaled*(P: typedesc, y, x, prm: untyped,
+                              outer, innerIn, innerOut, dstOffset,
+                              mult, shift, offset: untyped) =
+  dispatch(steady_backend.concatSliceRescaled(P, y, x, prm, outer, innerIn,
+                                              innerOut, dstOffset,
+                                              mult, shift, offset),
+           reference.concatSliceRescaled(P, y, x, prm, outer, innerIn,
+                                         innerOut, dstOffset,
+                                         mult, shift, offset))
+
+template meanSpatial*(P: typedesc, y, x, corr, prm: untyped,
+                      inH, inW, channels: untyped) =
+  dispatch(steady_backend.meanSpatial(P, y, x, corr, prm, inH, inW, channels),
+           reference.meanSpatial(P, y, x, corr, prm, inH, inW, channels))
+
+template lut1d*(P: typedesc, y, x, n, table: untyped) =
+  dispatch(steady_backend.lut1d(P, y, x, n, table),
+           reference.lut1d(P, y, x, n, table))
+
+template softmax*(P: typedesc, y, x, rows, classes, expLut: untyped,
+                  outMult, outShift, outZeroPoint, actMin, actMax: untyped) =
+  dispatch(steady_backend.softmax(P, y, x, rows, classes, expLut, outMult,
+                                  outShift, outZeroPoint, actMin, actMax),
+           reference.softmax(P, y, x, rows, classes, expLut, outMult, outShift,
+                             outZeroPoint, actMin, actMax))

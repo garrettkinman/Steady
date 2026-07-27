@@ -1,0 +1,218 @@
+# Copyright (c) 2026 Garrett Kinman
+#
+# This software is released under the MIT License.
+# https://opensource.org/licenses/MIT
+#
+# Template. `tests/models/check.sh` substitutes @MODEL@ and drops a copy next
+# to the generated module, so that `import ./@MODEL@` resolves without a search
+# path and the model's companion weights .c is found relative to it.
+
+## Differential runner for one model.
+##
+##   runner gen   <model.tflite> <io.txt> <trials>   choose inputs, state the
+##                                                   quantization at both ends
+##   runner check <io.txt> <ref.txt> <tolerance>     run the compiled model and
+##                                                   compare with TFLite
+##
+## Inputs are chosen here rather than in the reference script because the graph
+## input's quantization is something only the importer knows: after a boundary
+## QUANTIZE is stripped, the model's input is a tensor that was internal to the
+## file.
+
+import std/[os, strutils, strformat, sequtils, tables]
+import steadyc
+import ./@MODEL@ as model
+
+proc lcg(seed: uint32, n: int): seq[int32] =
+  result = newSeq[int32](n)
+  var s = seed
+  for i in 0 ..< n:
+    s = s * 1664525'u32 + 1013904223'u32
+    result[i] = int32((s shr 16) and 0xFF'u32) - 128'i32
+
+proc constant(v: int32, n: int): seq[int32] =
+  newSeqWith(n, v)
+
+proc trialsFor(nIn: int, count: int, inZero: int32): seq[seq[int32]] =
+  ## Random draws, plus the corners. Saturation and the zero point are where a
+  ## quantized kernel and a reference implementation part company, so they are
+  ## not left to chance.
+  result.add constant(inZero, nIn)
+  result.add constant(-128'i32, nIn)
+  result.add constant(127'i32, nIn)
+  for i in 0 ..< count:
+    result.add lcg(97'u32 + uint32(i) * 7919'u32, nIn)
+
+proc gen(modelPath, ioPath: string, count: int) =
+  let g = importTfliteFile(modelPath)
+  let inT = g.tensors[g.inputs[0]]
+  let outT = g.tensors[g.outputs[0]]
+  let inZero = if inT.quant.zeroPoints.len > 0: inT.quant.zeroPoints[0] else: 0'i32
+  let outZero = if outT.quant.zeroPoints.len > 0: outT.quant.zeroPoints[0] else: 0'i32
+  let inScale = if inT.quant.scales.len > 0: inT.quant.scales[0] else: 1.0
+  let outScale = if outT.quant.scales.len > 0: outT.quant.scales[0] else: 1.0
+
+  var s = &"model {g.name}\n"
+  s.add &"inputs {inT.numElements}\n"
+  s.add &"outputs {outT.numElements}\n"
+  s.add &"in_scale {inScale:.17e}\n"
+  s.add &"in_zero {inZero}\n"
+  s.add &"out_scale {outScale:.17e}\n"
+  s.add &"out_zero {outZero}\n"
+  for t in trialsFor(inT.numElements, count, inZero):
+    var line = "trial"
+    for v in t: line.add " " & $v
+    s.add line & "\n"
+  writeFile(ioPath, s)
+  echo &"    {trialsFor(inT.numElements, count, inZero).len} trials, " &
+       &"{inT.numElements} in, {outT.numElements} out"
+
+proc readTrials(path: string): tuple[meta: seq[(string, string)], trials: seq[seq[int32]]] =
+  for line in path.lines:
+    let l = line.strip
+    if l.len == 0 or l.startsWith("#"): continue
+    let sp = l.find(' ')
+    if sp < 0: continue
+    let key = l[0 ..< sp]
+    let rest = l[sp + 1 .. ^1]
+    if key == "trial":
+      var vals: seq[int32]
+      for f in rest.splitWhitespace: vals.add int32(parseInt(f))
+      result.trials.add vals
+    else:
+      result.meta.add (key, rest)
+
+proc check(ioPath, refPath: string, tolerance: int) =
+  let io = readTrials(ioPath)
+  let reference = readTrials(refPath)
+  var nOut = 0
+  for (k, v) in io.meta:
+    if k == "outputs": nOut = parseInt(v)
+  if io.trials.len != reference.trials.len:
+    quit &"FAIL: {io.trials.len} inputs but {reference.trials.len} reference outputs", 1
+
+  var worst = 0
+  var mismatched = 0
+  var total = 0
+  var top1 = 0
+  var exact = 0
+
+  for i, input in io.trials:
+    let inp = model.input0()
+    for j, v in input: inp[j] = int8(v)
+    model.invoke()
+    let outp = model.output0()
+
+    let want = reference.trials[i]
+    if want.len != nOut:
+      quit &"FAIL: trial {i} reference has {want.len} values, expected {nOut}", 1
+
+    var trialWorst = 0
+    var gotBest = 0
+    var wantBest = 0
+    for j in 0 ..< nOut:
+      let got = int(outp[j])
+      let d = abs(got - int(want[j]))
+      inc total
+      if d > 0: inc mismatched
+      if d > trialWorst: trialWorst = d
+      if got > int(outp[gotBest]): gotBest = j
+      if want[j] > want[wantBest]: wantBest = j
+    if trialWorst == 0: inc exact
+    if gotBest == wantBest: inc top1
+    if trialWorst > worst: worst = trialWorst
+
+  let pct = 100.0 * float(total - mismatched) / float(total)
+  echo &"    {io.trials.len} trials  identical outputs {exact}/{io.trials.len}  " &
+       &"elements equal {pct:.3f}%  max diff {worst}  " &
+       &"argmax agrees {top1}/{io.trials.len}"
+  if worst > tolerance:
+    quit &"FAIL: max difference {worst} exceeds the tolerance of {tolerance}", 1
+
+proc tensors(modelPath, ioPath, refPath: string) =
+  ## Per-operator attribution. Runs the *simulator* over trial 0 and compares
+  ## every intermediate against TFLite's, matched by tensor name.
+  ##
+  ## The gate is not "everything matches" but "the first thing that does not
+  ## match is an operator we have already accounted for". Desktop TFLite
+  ## evaluates int8 FULLY_CONNECTED and the generic MEAN reducer in float; its
+  ## convolutions use gemmlowp fixed point, which is what this compiler,
+  ## CMSIS-NN and TFLite Micro all do. So those two drifting by an LSB is
+  ## explained, and a convolution drifting is a regression — this distinguishes
+  ## them instead of averaging both into one tolerance.
+  ##
+  ## For MEAN the difference is not even in TFLite's favour: on the four
+  ## MobileNetV2 channels where the two disagree, the exact real value is
+  ## nearer our answer than theirs, because their float path mis-rounds just
+  ## past a tie. See the note in tests/models/check.sh.
+  let g = importTfliteFile(modelPath)
+  let io = readTrials(ioPath)
+  if io.trials.len == 0: quit "FAIL: no trials", 1
+
+  var inputs = initTable[int, seq[int32]]()
+  inputs[g.inputs[0]] = io.trials[0]
+  let bufs = simulate(g, inputs)
+
+  var reference = initTable[string, seq[int32]]()
+  for line in refPath.lines:
+    let tab = line.find('\t')
+    if tab < 0: continue
+    var vals: seq[int32]
+    for f in line[tab + 1 .. ^1].splitWhitespace: vals.add int32(parseInt(f))
+    reference[line[0 ..< tab]] = vals
+
+  # Which tensors are produced by a fully-connected op, and in what order the
+  # graph computes them.
+  var producedBy = initTable[int, OpKind]()
+  for op in g.ops:
+    producedBy[op.outputs[0]] = op.kind
+
+  var compared = 0
+  var exact = 0
+  var firstBad = -1
+  var worst = 0
+  for ti, t in g.tensors:
+    if t.dtype != dtInt8 or ti notin bufs: continue
+    if t.name notin reference: continue
+    let want = reference[t.name]
+    let got = bufs[ti]
+    if want.len != got.len: continue
+    inc compared
+    var d = 0
+    for i in 0 ..< got.len:
+      let diff = abs(int(got[i]) - int(want[i]))
+      if diff > d: d = diff
+    if d == 0:
+      inc exact
+    else:
+      if d > worst: worst = d
+      if firstBad < 0: firstBad = ti
+      let kind = if ti in producedBy: $producedBy[ti] else: "graph input"
+      echo &"      diverges by {d} at '{t.name[0 .. min(48, t.name.high)]}' ({kind})"
+
+  echo &"    {exact}/{compared} intermediate tensors bit-identical" &
+       (if worst > 0: &", worst {worst} LSB" else: "")
+  if firstBad >= 0:
+    let kind = if firstBad in producedBy: producedBy[firstBad] else: okReshape
+    const Explained = {okFullyConnected, okMean}
+    if kind notin Explained:
+      echo &"FAIL: the first divergence is a {kind}. Only {Explained} are " &
+           "known to differ from desktop TFLite, because it evaluates those " &
+           "in float; the integer path is expected to be exact everywhere else"
+      quit 1
+
+when isMainModule:
+  let args = commandLineParams()
+  if args.len < 1: quit "usage: runner gen|check ...", 1
+  case args[0]
+  of "gen":
+    if args.len < 4: quit "usage: runner gen <model.tflite> <io.txt> <trials>", 1
+    gen(args[1], args[2], parseInt(args[3]))
+  of "check":
+    if args.len < 4: quit "usage: runner check <io.txt> <ref.txt> <tolerance>", 1
+    check(args[1], args[2], parseInt(args[3]))
+  of "tensors":
+    if args.len < 4: quit "usage: runner tensors <model.tflite> <io.txt> <all.txt>", 1
+    tensors(args[1], args[2], args[3])
+  else:
+    quit &"unknown mode '{args[0]}'", 1

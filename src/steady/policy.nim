@@ -121,9 +121,15 @@ func satRoundDoublingHighMul*(a, b: int32): int32 {.inline.} =
 func roundingDivideByPOT*(x: int32, exponent: int32): int32 {.inline.} =
   ## gemmlowp RoundingDivideByPOT: x / 2^exponent, rounding half away from
   ## zero. Note this is *not* an arithmetic shift — the tie handling differs.
+  ##
+  ## `exponent` reaches 31, so the mask is built in 64 bits and narrowed:
+  ## `1'i32 shl 31` does not fit an int32. gemmlowp writes `1ll << exponent`
+  ## for the same reason. This is not a theoretical case — `quantizeMultiplier`
+  ## clamps its shift at -31, and a convolution channel whose weights are all
+  ## but zero produces exactly that, which is how a real MobileNet found it.
   if exponent == 0:
     return x
-  let mask = (1'i32 shl exponent) - 1'i32
+  let mask = int32((1'i64 shl exponent) - 1'i64)
   let remainder = x and mask
   let threshold = (mask shr 1) + (if x < 0: 1'i32 else: 0'i32)
   result = (x shr exponent)
@@ -170,12 +176,37 @@ func divAccum*(_: typedesc[AffineI8], acc: int32, n: int): int32 {.inline.} =
   if acc > 0: (acc + d div 2) div d
   else: (acc - d div 2) div d
 
+template meanScale*(_: typedesc[AffineI8], acc: int32, count: int): int32 =
+  ## Brings an accumulated sum into the units `finish` expects for a *mean*.
+  ##
+  ## For affine this is the identity: the host folds `1/count` into the output
+  ## multiplier, so the whole reduction rounds exactly once, in `finish`. That
+  ## is both more accurate than dividing first — an integer divide would round
+  ## to the input's grid before requantizing, costing up to half an LSB — and
+  ## cheaper, since the kernel then contains no division at all.
+  ##
+  ## Distinct from `divAccum`, which average-pooling needs to keep doing:
+  ## pooling preserves quantization, so its division is the whole operation and
+  ## TFLite performs it as an integer divide that we match bit for bit.
+  acc
+
 func storeOf*(_: typedesc[AffineI8], acc: int32): int8 {.inline.} =
   ## Narrow without requantizing — for ops whose input and output share a
   ## quantization (pooling, reductions). Saturates rather than wrapping.
   if acc < -128'i32: -128'i8
   elif acc > 127'i32: 127'i8
   else: int8(acc)
+
+template lutIndex*(_: typedesc[AffineI8], v: int8): int =
+  ## Raw storage byte of a value, which is what a host-generated lookup table
+  ## is keyed on. Two's-complement, so -128 lands at 128 and the table the
+  ## host writes has to agree — that agreement is what the end-to-end test
+  ## checks.
+  ##
+  ## Deliberately absent for `RealF32`: a 32-bit store has no enumerable
+  ## domain, so `lut1d` simply does not instantiate for it and the host
+  ## rejects LUT ops under that policy rather than reaching for libm.
+  int(cast[uint8](v))
 
 func addRescaled*(_: typedesc[AffineI8], acc: var int32, v: int8,
                   mult, shift, offset: int32) {.inline.} =
@@ -212,6 +243,12 @@ template accumulate*(_: typedesc[RealF32], acc: var float32, v: float32) =
 
 func divAccum*(_: typedesc[RealF32], acc: float32, n: int): float32 {.inline.} =
   acc / float32(n)
+
+template meanScale*(_: typedesc[RealF32], acc: float32, count: int): float32 =
+  ## No multiplier to fold into, so a real policy divides here. Same kernel
+  ## source either way — this is the policy absorbing the difference, which is
+  ## what it is for.
+  acc / float32(count)
 
 func storeOf*(_: typedesc[RealF32], acc: float32): float32 {.inline.} = acc
 
@@ -252,11 +289,19 @@ template accumulate*(_: typedesc[RealFp8], acc: var float32, v: Fp8) =
 func divAccum*(_: typedesc[RealFp8], acc: float32, n: int): float32 {.inline.} =
   acc / float32(n)
 
+template meanScale*(_: typedesc[RealFp8], acc: float32, count: int): float32 =
+  acc / float32(count)
+
 func storeOf*(_: typedesc[RealFp8], acc: float32): Fp8 {.inline.} = acc.toFp8
 
 func addRescaled*(_: typedesc[RealFp8], acc: var float32, v: Fp8,
                   mult, shift, offset: int32) {.inline.} =
   acc = acc + v.toFloat32
+
+template lutIndex*(_: typedesc[RealFp8], v: Fp8): int =
+  ## The whole point of the canary: a posit policy's table lookup is this
+  ## same expression, and it needs no arithmetic on the target at all.
+  int(v.bits)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # CONVENIENCE CONSTRUCTORS

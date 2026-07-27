@@ -40,7 +40,20 @@ type
     aMult*, aShift*, bMult*, bShift*: int32
     aOffset*, bOffset*: int32       ## TFLite input_offset, i.e. negated zero point
 
+  OperandRescale* = object
+    ## One operand's rescale into a common accumulator domain. Same three
+    ## numbers `AddRescale` carries per side, for ops with a variable number
+    ## of operands.
+    mult*, shift*: int32
+    offset*: int32                  ## negated zero point
+
   QuantError* = object of CatchableError
+
+const RescaleLeftShift* = 20
+  ## Operands of a multi-input elementwise op are shifted left by this much
+  ## before their Q31 multiply, to keep precision through the rescale. Must
+  ## match `AddLeftShift` in the runtime's policy module — the host computes
+  ## multipliers relative to it and the kernel applies it.
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # TFLITE MULTIPLIER ENCODING
@@ -172,7 +185,7 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
     return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi),
             AddRescale())
 
-  const LeftShift = 20
+  const LeftShift = RescaleLeftShift
   let aScale = aT.quant.scaleAt(0)
   let bScale = bT.quant.scaleAt(0)
   let outScale = outT.quant.scaleAt(0)
@@ -196,6 +209,99 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
   (params, AddRescale(aMult: am, aShift: ash, bMult: bm, bShift: bsh,
                       aOffset: -aT.quant.zeroAt(0),
                       bOffset: -bT.quant.zeroAt(0)))
+
+proc resolveConcatParams*(g: Graph, ins: openArray[Tensor], outT: Tensor,
+                          fused: FusedAct): (ResolvedParams, seq[OperandRescale]) =
+  ## Concatenation is a copy, until the operands disagree about their
+  ## quantization — which the TFLite converter usually resolves for you and
+  ## sometimes does not. When they disagree, each operand is rescaled into the
+  ## output's domain through the *same* two-stage path elementwise add uses:
+  ## a per-operand multiplier into a common domain, then one shared multiplier
+  ## out of it. Same primitive, same tests, no second implementation.
+  ##
+  ## Note that TFLite's reference concatenation rescales in float. This does
+  ## it in Q31 fixed point, consistent with the rest of the runtime and with
+  ## not requiring an FPU; results can differ from TFLite by an LSB when the
+  ## quantizations differ, and are identical when they agree, because then the
+  ## emitter skips the arithmetic entirely.
+  if not g.policy.isAffine:
+    let (lo, hi) = realActRange(fused)
+    return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi),
+            newSeq[OperandRescale](ins.len))
+
+  var maxScale = 0.0
+  for t in ins:
+    maxScale = max(maxScale, t.quant.scaleAt(0))
+  let twiceMax = 2.0 * maxScale
+  let outScale = outT.quant.scaleAt(0)
+
+  var rescales = newSeq[OperandRescale](ins.len)
+  for i, t in ins:
+    let (m, s) = quantizeMultiplier(t.quant.scaleAt(0) / twiceMax)
+    rescales[i] = OperandRescale(mult: m, shift: s, offset: -t.quant.zeroAt(0))
+
+  let (om, osh) = quantizeMultiplier(
+    twiceMax / (float64(1 shl RescaleLeftShift) * outScale))
+  var params = ResolvedParams(affine: true)
+  params.mult = @[om]
+  params.shift = @[osh]
+  params.outZeroPoint = outT.quant.zeroAt(0)
+  let (lo, hi) = affineActRange(fused, outT.quant)
+  params.qActMin = lo
+  params.qActMax = hi
+  (params, rescales)
+
+proc resolveMeanParams*(g: Graph, inT, outT: Tensor, count: int,
+                        fused: FusedAct): (ResolvedParams, int32) =
+  ## Params for a spatial mean, plus the accumulator-domain zero-point
+  ## correction `-count * Zx`. That correction plays exactly the role a folded
+  ## bias plays in the matmul family: it is a compile-time constant, and
+  ## passing it keeps the kernel free of zero points.
+  ##
+  ## The multiplier also carries the `1/count` of the mean itself — see
+  ## `meanScale` in the runtime's policy module.
+  if not g.policy.isAffine:
+    let (lo, hi) = realActRange(fused)
+    return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi), 0'i32)
+
+  # The division by `count` rides along in the multiplier, so the kernel
+  # accumulates and requantizes with a single rounding step. Dividing in the
+  # kernel first would round to the input's integer grid and lose up to half an
+  # LSB before the requantization even starts.
+  let effective = inT.quant.scaleAt(0) / (float64(count) * outT.quant.scaleAt(0))
+  let (m, s) = quantizeMultiplier(effective)
+  var params = ResolvedParams(affine: true)
+  params.mult = @[m]
+  params.shift = @[s]
+  params.outZeroPoint = outT.quant.zeroAt(0)
+  let (lo, hi) = affineActRange(fused, outT.quant)
+  params.qActMin = lo
+  params.qActMax = hi
+  (params, -int32(count) * inT.quant.zeroAt(0))
+
+const SoftmaxProbBits* = 15
+  ## The softmax kernel normalises into a Q15 probability before requantizing.
+  ## Must match the shift in the kernel; 15 bits is ~128x finer than the 1/256
+  ## output grid TFLite pins int8 softmax to.
+
+proc resolveSoftmaxParams*(g: Graph, outT: Tensor): ResolvedParams =
+  ## Converts the kernel's Q15 probability to the output quantization. TFLite
+  ## fixes int8 softmax output at scale 1/256, zero point -128; any positive
+  ## output scale works here, and probabilities above the representable range
+  ## clamp rather than wrap.
+  if not g.policy.isAffine:
+    raise newException(QuantError,
+      "softmax is an integer-affine op; the host should have rejected it " &
+      "during validation for this policy")
+  let (m, s) = quantizeMultiplier(
+    1.0 / (float64(1 shl SoftmaxProbBits) * outT.quant.scaleAt(0)))
+  result = ResolvedParams(affine: true)
+  result.mult = @[m]
+  result.shift = @[s]
+  result.outZeroPoint = outT.quant.zeroAt(0)
+  let (lo, hi) = affineActRange(faNone, outT.quant)
+  result.qActMin = lo
+  result.qActMax = hi
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BIAS FOLDING
