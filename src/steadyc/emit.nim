@@ -77,6 +77,15 @@ func nimIdentKey*(s: string): string =
 func cSym(g: Graph, prefix, name: string): string =
   &"steady_{cIdent(g.name)}_{prefix}{cIdent(name)}"
 
+func reindent(code: string, by: int): string =
+  ## Shifts an already-indented block of generated code further right, keeping
+  ## exactly one trailing newline. `strutils.indent` pads the empty line a
+  ## trailing "\n" produces and then drops the newline itself, which puts the
+  ## next line of output in the wrong place.
+  let pad = spaces(by)
+  for line in code.strip(leading = false, chars = {'\n'}).splitLines:
+    result.add pad & line & "\n"
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # C LITERAL FORMATTING
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -277,7 +286,15 @@ const
   ArenaSize* = {p.arenaSize}
   ModelName* = "{g.name}"
   ToolVersion* = "{ToolVersion}"
+  TotalMacs* = {g.totalMacs}
+    ## Multiply-accumulates per invocation, counted on the host including
+    ## padded taps. A compile-time constant, so a benchmark can report MAC/s
+    ## and a target-side budget check costs nothing.
 """
+  for i, t in g.inputs:
+    nimSrc.add &"  Input{i}Elems* = {g.tensors[t].numElements}\n"
+  for i, t in g.outputs:
+    nimSrc.add &"  Output{i}Elems* = {g.tensors[t].numElements}\n"
   if sourceHash.len > 0:
     nimSrc.add &"  SourceHash* = \"{sourceHash}\"\n"
   if backend.layoutTag.len > 0:
@@ -287,6 +304,14 @@ const
 
   # ---- constants ----------------------------------------------------------
   var declBlock = ""
+
+  # Code is accumulated one op at a time rather than into a single string, so
+  # that the same text can be assembled twice: into `invoke`, and — only under
+  # `-d:steadyProfile` — into a per-op entry point the benchmark harness calls
+  # individually. Attribution is otherwise guesswork, and a profiler that
+  # cannot name the operator cannot tell "this layer does more work" from
+  # "this kernel is worse".
+  var opChunks: seq[string]
   var opCalls = ""
 
   # Extern declarations are emitted straight into the generated C rather than
@@ -389,8 +414,11 @@ const
   for oi, op in g.ops:
     curOp = oi
     curKind = op.kind
+    let mark = opCalls.len       # where this op's code starts
+
     if op.isPureAlias:
       opCalls.add &"  # op{oi} '{op.name}': reshape — aliased, no code emitted\n"
+      opChunks.add opCalls[mark .. ^1]
       continue
 
     opCalls.add &"  # op{oi} '{op.name}' ({op.kind})\n"
@@ -579,6 +607,8 @@ const
     of okReshape:
       discard
 
+    opChunks.add opCalls[mark .. ^1]
+
   # ---- assemble -----------------------------------------------------------
   if declBlock.len > 0:
     nimSrc.add "\n# Flash-resident constants, defined in the companion C file.\n"
@@ -622,6 +652,55 @@ template A(off: int, T: typedesc): ptr UncheckedArray[T] =
     nimSrc.add "  discard\n"
   else:
     nimSrc.add opCalls
+
+  # ---- profiling entry points ---------------------------------------------
+  # Off unless asked for, and additive when it is on: `invoke` above is
+  # byte-for-byte the same code either way, so a profiled build measures the
+  # kernels the unprofiled one runs. The cost of a hook inside `invoke` would
+  # be small but it would be measured, and on this scale it is the measurement
+  # that has to be trustworthy.
+  if g.ops.len > 0:
+    nimSrc.add &"""
+when defined(steadyProfile):
+  ## Per-operator entry points, for the host benchmark harness. One `case`
+  ## over a compile-time constant, so each branch is still the same
+  ## straight-line code `invoke` contains — no dispatch reaches a kernel.
+  ##
+  ## Calling an op out of sequence computes nonsense, deliberately: the arena
+  ## packs buffers, so op N's inputs generally no longer exist by the time op
+  ## N+1 has run. Integer kernels are branch-light and data-independent, so
+  ## nonsense costs exactly what real data costs, which is what makes timing
+  ## one op at a time legitimate. Anything that reads a *result* must call
+  ## `invoke`.
+
+  type OpProfile* = object
+    name*: string
+    kind*: string
+    macs*: int          ## host-counted, padded taps included
+    outElems*: int      ## output tensor size, the measure for data movement
+
+  const
+    OpCount* = {g.ops.len}
+    OpProfiles*: array[OpCount, OpProfile] = [
+"""
+    for oi, op in g.ops:
+      let outElems = g.tensors[op.outputs[0]].numElements
+      let macs = if op.isPureAlias: 0 else: g.macCount(op)
+      nimSrc.add &"      OpProfile(name: \"{op.name}\", kind: \"{op.kind}\", " &
+                 &"macs: {macs}, outElems: {outElems}),\n"
+    nimSrc.add "    ]\n\n  proc invokeOp*(i: int) =\n    case i\n"
+    for oi, chunk in opChunks:
+      nimSrc.add &"    of {oi}:\n"
+      nimSrc.add reindent(chunk, 4)
+      # A branch holding only a comment — an aliased reshape — is not a
+      # statement list Nim will accept.
+      var hasCode = false
+      for line in chunk.splitLines:
+        let s = line.strip
+        if s.len > 0 and not s.startsWith("#"): hasCode = true
+      if not hasCode:
+        nimSrc.add "      discard\n"
+    nimSrc.add "    else: discard\n"
 
   var hdr, src: string
   emitWeightsFiles(g, blobs, stem, hdr, src)

@@ -156,6 +156,42 @@ func byteSize*(t: Tensor): int =
 func isPerChannel*(q: Quant): bool = q.axis >= 0 and q.scales.len > 1
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# COST MODEL
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# A single number per op, computed on the host, so the benchmark can report
+# MAC/s rather than only milliseconds. Milliseconds say which op is slow;
+# MAC/s says whether that is because it does more work or because the kernel
+# is worse, and only the second is actionable.
+
+func macCount*(g: Graph, op: Op): int =
+  ## Multiply-accumulates one execution of `op` performs, counted the way the
+  ## kernel actually performs them rather than the way the mathematics
+  ## minimally requires.
+  ##
+  ## Padded taps are included, because they are multiplied against `padValue`
+  ## rather than skipped — that is what keeps the folded bias valid at the
+  ## edges. Counting the ideal number instead would credit a SAME-padded 3x3
+  ## layer with work it does not do and quietly overstate its MAC/s.
+  ##
+  ## Zero for ops that move, compare or tabulate rather than multiply; their
+  ## cost is in loads and stores, and `numElements` of the output is the
+  ## honest measure there.
+  let y = g.tensors[op.outputs[0]]
+  case op.kind
+  of okConv2d:
+    let inC = g.tensors[op.inputs[0]].shape[3]
+    y.numElements * op.kH * op.kW * inC
+  of okDepthwiseConv2d:
+    y.numElements * op.kH * op.kW
+  of okFullyConnected:
+    y.numElements * g.tensors[op.inputs[1]].shape[1]
+  else:
+    0
+
+func totalMacs*(g: Graph): int =
+  for op in g.ops: result += g.macCount(op)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BUILDER
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

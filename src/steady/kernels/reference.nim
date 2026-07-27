@@ -30,6 +30,57 @@ import ../policy
 export policy
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# BLOCKING
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# The matmul-family kernels compute several outputs at once. Two reasons, and
+# the second is the one that shows up on a machine with no cache to speak of:
+#
+#   * **Loads.** A convolution's input patch is read once per output channel by
+#     the obvious loop nest. Reading it once per *block* of output channels
+#     divides activation loads by the block size, and reduction-heavy layers on
+#     small parts are load-bound long before they are multiply-bound.
+#   * **Dependency chains.** One accumulator per output means one `mac` cannot
+#     start until the last one retires. Several independent accumulators in
+#     flight let a pipelined core overlap them, which is most of the difference
+#     between a 3-multiply-deep loop and a saturated multiplier.
+#
+# What is *not* done here is splitting one output's reduction into partial sums
+# and adding them at the end. That is the other standard way to break a
+# dependency chain, and it re-associates the addition — exact for a wrapping
+# integer accumulator, not exact for float32 or fp8, and not exact for a posit
+# quire's rounding either. Every transform below leaves each individual
+# accumulator seeing exactly the taps it saw before, in exactly the order it saw
+# them, so bit-exactness against TFLite holds by construction rather than by
+# retesting. The differential harness confirms it on the six real models it can
+# compare, agreement statistics unchanged to the digit.
+#
+# Blocks are `static` template parameters rather than runtime values, so each
+# instantiation has constant loop bounds and the accumulator array can live in
+# registers. A runtime block count would put it back in memory and cost more
+# than the reuse gains.
+
+const
+  OcBlock = 4
+    ## Output channels per convolution block.
+  DwBlock = 4
+    ## Channels per depthwise block.
+  FcBlock = 4
+    ## Rows of a fully-connected weight matrix per block, sharing one pass over
+    ## the input vector.
+    ##
+    ## All three are four because four measured fastest, not because four is a
+    ## natural number: two was about 10% worse and eight was worse than two.
+    ## Eight is worth understanding, because it is the width a vector unit
+    ## would want — with eight accumulators plus eight weights and eight
+    ## activations live at once, the compiler spilled seven of the eight
+    ## accumulators to the stack, and the reuse did not pay for the traffic.
+    ## So the right width is a property of the target's register file, and
+    ## these are the first constants to re-tune for a different one. They are
+    ## three constants rather than one because the kernels want them for
+    ## different reasons, and a machine with SIMD will not want the same number
+    ## in all three places.
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # FULLY CONNECTED
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -43,18 +94,34 @@ proc fullyConnected*[P, S, B, PT](
     outDim, inDim: int) =
   ## y[outDim] = finish(W[outDim, inDim] * x[inDim] + bias)
   ## Weights are row-major over [outDim, inDim].
+  ##
+  ## Rows are computed `FcBlock` at a time. The input vector is read once for
+  ## the whole block instead of once per row, which is the entire trick: a
+  ## fully-connected layer reads its weights exactly once no matter what, so
+  ## activation loads are the only thing left to save.
   static:
     assert S is Store(P), "fullyConnected: storage type mismatch"
     assert B is Bias(P), "fullyConnected: bias type mismatch"
     assert PT is Params(P), "fullyConnected: params type mismatch"
 
-  for o in 0 ..< outDim:
-    var acc = zeroAccum(P)
-    let base = o * inDim
+  template rows(Blk: static int, o: int) =
+    var acc: array[Blk, Accum(P)]
+    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
     for i in 0 ..< inDim:
-      mac(P, acc, w[base + i], x[i])
-    addBias(P, acc, bias[o])
-    y[o] = finish(P, acc, prm, o)
+      let v = x[i]
+      for k in 0 ..< Blk:
+        mac(P, acc[k], w[(o + k) * inDim + i], v)
+    for k in 0 ..< Blk:
+      addBias(P, acc[k], bias[o + k])
+      y[o + k] = finish(P, acc[k], prm, o + k)
+
+  var o = 0
+  while o + FcBlock <= outDim:
+    rows(FcBlock, o)
+    o += FcBlock
+  while o < outDim:
+    rows(1, o)
+    inc o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # CONV2D  (NHWC activations, OHWI filters, batch 1)
@@ -74,34 +141,85 @@ proc conv2d*[P, S, B, PT](
     padTop, padLeft: int,
     dilationH, dilationW: int,
     padValue: S) =
+  ## Output channels are computed `OcBlock` at a time, so one pass over an
+  ## input patch feeds four filters rather than being repeated for each.
+  ##
+  ## A stride-1-or-more 1x1 convolution with no padding gets its own path.
+  ## That is not a micro-optimization on this class of model: in a
+  ## MobileNet-class network the overwhelming majority of multiplies are in
+  ## pointwise convolutions, and for them the "patch" is a single contiguous
+  ## run of `inC` values. The general path's per-tap work — deriving `iy` and
+  ## `ix`, testing them against the input bounds, re-deriving a weight base —
+  ## is then pure overhead wrapped around a reduction that may be only eight
+  ## elements long. The fast path deletes all of it and leaves one loop.
+  ##
+  ## The 1x1 path needs no bounds test because it cannot go out of bounds: with
+  ## no padding the host's own shape rule gives `(outH - 1) * strideH <= inH - 1`,
+  ## so every sampled position is inside by construction. Shapes are validated
+  ## on the host precisely so kernels can rely on them.
   static:
     assert S is Store(P), "conv2d: storage type mismatch"
     assert B is Bias(P), "conv2d: bias type mismatch"
     assert PT is Params(P), "conv2d: params type mismatch"
 
+  let filterSize = kH * kW * inC
+
+  template filters(Blk: static int, oc: int, pointwise: static bool) =
+    ## `Blk` filters over one output pixel. Each accumulator sees the same taps
+    ## in the same order as the unblocked kernel: ky, then kx, then ic.
+    var acc: array[Blk, Accum(P)]
+    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
+
+    when pointwise:
+      let xBase = (inYOrigin * inW + inXOrigin) * inC
+      for ic in 0 ..< inC:
+        let v = x[xBase + ic]
+        for k in 0 ..< Blk:
+          mac(P, acc[k], w[(oc + k) * filterSize + ic], v)
+    else:
+      for ky in 0 ..< kH:
+        let iy = inYOrigin + ky * dilationH
+        let rowInside = iy >= 0 and iy < inH
+        for kx in 0 ..< kW:
+          let ix = inXOrigin + kx * dilationW
+          let wBase = (ky * kW + kx) * inC
+          if rowInside and ix >= 0 and ix < inW:
+            let xBase = (iy * inW + ix) * inC
+            for ic in 0 ..< inC:
+              let v = x[xBase + ic]
+              for k in 0 ..< Blk:
+                mac(P, acc[k], w[(oc + k) * filterSize + wBase + ic], v)
+          else:
+            for ic in 0 ..< inC:
+              for k in 0 ..< Blk:
+                mac(P, acc[k], w[(oc + k) * filterSize + wBase + ic], padValue)
+
+    for k in 0 ..< Blk:
+      addBias(P, acc[k], bias[oc + k])
+      y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
+
+  let pointwise = kH == 1 and kW == 1 and padTop == 0 and padLeft == 0
+
   for oy in 0 ..< outH:
     let inYOrigin = oy * strideH - padTop
     for ox in 0 ..< outW:
       let inXOrigin = ox * strideW - padLeft
-      for oc in 0 ..< outC:
-        var acc = zeroAccum(P)
-        let wOC = oc * kH * kW * inC
-        for ky in 0 ..< kH:
-          let iy = inYOrigin + ky * dilationH
-          let rowInside = iy >= 0 and iy < inH
-          for kx in 0 ..< kW:
-            let ix = inXOrigin + kx * dilationW
-            let inside = rowInside and ix >= 0 and ix < inW
-            let wBase = wOC + (ky * kW + kx) * inC
-            if inside:
-              let xBase = (iy * inW + ix) * inC
-              for ic in 0 ..< inC:
-                mac(P, acc, w[wBase + ic], x[xBase + ic])
-            else:
-              for ic in 0 ..< inC:
-                mac(P, acc, w[wBase + ic], padValue)
-        addBias(P, acc, bias[oc])
-        y[(oy * outW + ox) * outC + oc] = finish(P, acc, prm, oc)
+      let yBase = (oy * outW + ox) * outC
+      var oc = 0
+      if pointwise:
+        while oc + OcBlock <= outC:
+          filters(OcBlock, oc, true)
+          oc += OcBlock
+        while oc < outC:
+          filters(1, oc, true)
+          inc oc
+      else:
+        while oc + OcBlock <= outC:
+          filters(OcBlock, oc, false)
+          oc += OcBlock
+        while oc < outC:
+          filters(1, oc, false)
+          inc oc
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # DEPTHWISE CONV2D  (NHWC activations, 1HWC filters)
@@ -124,32 +242,73 @@ proc depthwiseConv2d*[P, S, B, PT](
     padValue: S) =
   ## Output channel count is inC * depthMultiplier. Filter layout is
   ## [1, kH, kW, outC], matching TFLite.
+  ##
+  ## Channels are the blocked axis, and for this operator that is a statement
+  ## about memory rather than about arithmetic. A depthwise convolution has no
+  ## channel reduction: every output is nine multiplies over nine values that
+  ## are `inC` elements apart in NHWC. Walking the kernel window per channel —
+  ## the obvious nest — therefore touches nine cache lines, uses one byte of
+  ## each, and does it again for the next channel.
+  ##
+  ## Blocking the channel axis turns that inside out. For a block of
+  ## `DwBlock` channels the nine activation loads become nine *contiguous*
+  ## runs, and the nine weight loads likewise, because the filter's channel
+  ## axis is its innermost one. Same multiplies, a `DwBlock`-th of the touched
+  ## lines, and the inner loop is a shape a vector unit could take over
+  ## unchanged.
+  ##
+  ## The block requires `oc` and its input channel to advance together, which
+  ## holds exactly when `depthMultiplier` is 1 — the only value real converters
+  ## emit. A larger multiplier falls back to one channel at a time, where
+  ## `oc div depthMultiplier` is the right input channel and the arithmetic
+  ## costs nothing because it happens once per block rather than once per tap.
   static:
     assert S is Store(P), "depthwiseConv2d: storage type mismatch"
     assert B is Bias(P), "depthwiseConv2d: bias type mismatch"
     assert PT is Params(P), "depthwiseConv2d: params type mismatch"
 
   let outC = inC * depthMultiplier
+
+  template channels(Blk: static int, oc: int) =
+    ## `Blk` channels over one output pixel, each accumulator seeing its taps
+    ## in the original ky-then-kx order.
+    var acc: array[Blk, Accum(P)]
+    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
+    let ic0 = oc div depthMultiplier      # == oc whenever Blk > 1
+
+    for ky in 0 ..< kH:
+      let iy = inYOrigin + ky * dilationH
+      let rowInside = iy >= 0 and iy < inH
+      for kx in 0 ..< kW:
+        let ix = inXOrigin + kx * dilationW
+        let wBase = (ky * kW + kx) * outC + oc
+        if rowInside and ix >= 0 and ix < inW:
+          let xBase = (iy * inW + ix) * inC + ic0
+          for k in 0 ..< Blk:
+            mac(P, acc[k], w[wBase + k], x[xBase + k])
+        else:
+          for k in 0 ..< Blk:
+            mac(P, acc[k], w[wBase + k], padValue)
+
+    for k in 0 ..< Blk:
+      addBias(P, acc[k], bias[oc + k])
+      y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
+
+  let blocked = depthMultiplier == 1
+
   for oy in 0 ..< outH:
     let inYOrigin = oy * strideH - padTop
     for ox in 0 ..< outW:
       let inXOrigin = ox * strideW - padLeft
-      for ic in 0 ..< inC:
-        for m in 0 ..< depthMultiplier:
-          let oc = ic * depthMultiplier + m
-          var acc = zeroAccum(P)
-          for ky in 0 ..< kH:
-            let iy = inYOrigin + ky * dilationH
-            let rowInside = iy >= 0 and iy < inH
-            for kx in 0 ..< kW:
-              let ix = inXOrigin + kx * dilationW
-              let wIdx = (ky * kW + kx) * outC + oc
-              if rowInside and ix >= 0 and ix < inW:
-                mac(P, acc, w[wIdx], x[(iy * inW + ix) * inC + ic])
-              else:
-                mac(P, acc, w[wIdx], padValue)
-          addBias(P, acc, bias[oc])
-          y[(oy * outW + ox) * outC + oc] = finish(P, acc, prm, oc)
+      let yBase = (oy * outW + ox) * outC
+      var oc = 0
+      if blocked:
+        while oc + DwBlock <= outC:
+          channels(DwBlock, oc)
+          oc += DwBlock
+      while oc < outC:
+        channels(1, oc)
+        inc oc
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # POOLING
