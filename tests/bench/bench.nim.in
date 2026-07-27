@@ -124,10 +124,19 @@ proc main() =
   fillInput()
   model.invoke()                    # warm: fault in the arena, prime the caches
 
+  # FNV-1a over the output, on the same input the on-target harness uses, so
+  # the two can be compared directly. `tests/mcu` prints the same number from
+  # a Cortex-M4; that they agree is an end-to-end statement about the runtime
+  # that no host-only test can make.
+  var checksum = 0x811c9dc5'u32
+  let outp = model.output0()
+  for i in 0 ..< model.Output0Elems:
+    checksum = (checksum xor uint32(cast[uint8](outp[i]))) * 0x01000193'u32
+
   let whole = measure(proc() = model.invoke(), target * 2, reps)
 
   echo &"    {model.OpCount} ops   {float(model.TotalMacs) / 1e6:.2f} MMAC   " &
-       &"arena {model.ArenaSize} bytes"
+       &"arena {model.ArenaSize} bytes   output checksum {checksum:08x}"
   echo &"    inference   {ms(whole.best)} ms   " &
        &"{rate(model.TotalMacs, whole.best):.2f} GMAC/s" &
        &"   (median {ms(whole.median)} ms, {whole.iters}x{whole.reps})"
@@ -160,9 +169,9 @@ proc main() =
     # Everything below a twentieth of a percent is noise on this scale, and
     # MobileNetV2 has enough reshapes to bury the interesting rows in them.
     if share < 0.05 and rank > 12: continue
-    echo &"      {i:>3}  {p.kind[2 .. ^1]:<18} {float(p.macs) / 1e6:>8.3f} " &
+    echo &"      {i:>3}  {($p.kind)[2 .. ^1]:<18} {float(p.macs) / 1e6:>8.3f} " &
          &"{ms(times[i]):>8} {rate(p.macs, times[i]):>7.2f} {share:>6.2f}  " &
-         &"{shortName(p.name, 34)}"
+         &"{shortName($p.name, 34)}"
 
   # ---- per kind -----------------------------------------------------------
   # The rollup is what actually directs the work: it answers "where do the
@@ -172,7 +181,7 @@ proc main() =
   var kindMacs = initOrderedTable[string, int]()
   var kindCount = initOrderedTable[string, int]()
   for i in 0 ..< model.OpCount:
-    let k = model.OpProfiles[i].kind[2 .. ^1]
+    let k = ($model.OpProfiles[i].kind)[2 .. ^1]
     kindTime[k] = kindTime.getOrDefault(k) + times[i]
     kindMacs[k] = kindMacs.getOrDefault(k) + model.OpProfiles[i].macs
     kindCount[k] = kindCount.getOrDefault(k) + 1
@@ -201,8 +210,8 @@ proc main() =
           &"{model.Output0Elems}\t{whole.best:.9e}\t-\n"
     for i in 0 ..< model.OpCount:
       let p = model.OpProfiles[i]
-      s.add &"{model.ModelName}\t{i}\t{p.kind}\t{p.macs}\t{p.outElems}\t" &
-            &"{times[i]:.9e}\t{p.name}\n"
+      s.add &"{model.ModelName}\t{i}\t{$p.kind}\t{p.macs}\t{p.outElems}\t" &
+            &"{times[i]:.9e}\t{$p.name}\n"
     writeFile(tsvPath, s)
 
 when isMainModule:

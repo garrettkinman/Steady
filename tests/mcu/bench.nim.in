@@ -1,0 +1,234 @@
+# Copyright (c) 2026 Garrett Kinman
+#
+# This software is released under the MIT License.
+# https://opensource.org/licenses/MIT
+#
+# Template. `tests/mcu/check.sh` substitutes @MODEL@ and drops a copy next to
+# the generated module, so `import ./@MODEL@` resolves without a search path.
+
+## On-target benchmark: one model, per-operator cycle counts.
+##
+## Everything the host benchmark has to apologise for is absent here. There is
+## no scheduler, no other process, no frequency scaling and no interrupt
+## enabled anywhere in the image, so `DWT->CYCCNT` counts exactly the cycles
+## the kernel spent and counts the same number every run. The awkward part of
+## the host harness — proving that a 3% difference is real — is not a problem
+## this file has.
+##
+## What it does have is a memory system worth measuring: weights are read from
+## flash through a prefetch buffer, a 32-line instruction cache and an 8-line
+## data cache, all three switchable at runtime. The benchmark sweeps them
+## rather than assuming a configuration, because the answer to "is blocking
+## worth it" is allowed to depend on that and the point is to find out.
+##
+## Output is plain text over the ST-LINK virtual COM port, one record per line,
+## framed by BEGIN/END so a host reader can attach at any time. The whole run
+## repeats forever: a benchmark that has to be raced against a reset is a
+## benchmark that gets run once.
+##
+## Nothing here allocates, and nothing here uses a Nim `string` — the integer
+## formatting is by hand for that reason. `nimble mcu` audits the image for
+## allocator symbols exactly as the freestanding check does.
+
+import ./@MODEL@ as model
+
+when not defined(steadyProfile):
+  {.error: "build with -d:steadyProfile so `invokeOp` exists".}
+
+const steadyNonce* {.strdefine.} = "dev"
+  ## A per-build nonce the host passes in and the record echoes back.
+  ##
+  ## Without it there is no way to tell a record produced by *this* firmware
+  ## from one the serial port had buffered from the last one, and the failure
+  ## is silent and extremely convincing: two different kernels reporting
+  ## cycle counts identical to the digit, which is exactly what it looks like
+  ## when you are reading a stale record. The host refuses any record whose
+  ## nonce is not the one it just built.
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# BOARD
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc boardPutc(c: char) {.importc: "board_putc", cdecl.}
+proc boardCycles(): uint32 {.importc: "board_cycles", cdecl.}
+proc boardSysclk(): uint32 {.importc: "board_sysclk", cdecl.}
+proc boardLed(on: cint) {.importc: "board_led", cdecl.}
+proc boardFlashCache(prefetch, icache, dcache: cint)
+  {.importc: "board_flash_cache", cdecl.}
+proc boardFlashAcr(): uint32 {.importc: "board_flash_acr", cdecl.}
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# OUTPUT
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc put(s: cstring) =
+  var i = 0
+  while s[i] != '\0':
+    boardPutc(s[i])
+    inc i
+
+proc putU(v: uint32) =
+  var buf: array[10, char]
+  var n = 0
+  var x = v
+  if x == 0:
+    boardPutc('0')
+    return
+  while x > 0'u32:
+    buf[n] = char(ord('0') + int(x mod 10'u32))
+    inc n
+    x = x div 10'u32
+  while n > 0:
+    dec n
+    boardPutc(buf[n])
+
+proc putHex(v: uint32) =
+  const digits = "0123456789abcdef"
+  for i in countdown(7, 0):
+    boardPutc(digits[int((v shr uint32(i * 4)) and 0xF'u32)])
+
+proc nl() = put("\r\n")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# MEASUREMENT
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+var cycleOverhead: uint32 = 0
+  ## What a measurement costs when it measures nothing. Small and constant,
+  ## but the fastest ops here are a few hundred cycles and an unsubtracted
+  ## overhead would land entirely on them.
+
+proc calibrateOverhead() =
+  var best = high(uint32)
+  for _ in 0 ..< 16:
+    let t0 = boardCycles()
+    let t1 = boardCycles()
+    let d = t1 - t0
+    if d < best: best = d
+  cycleOverhead = best
+
+template measure(reps: int, body: untyped): uint32 =
+  ## Minimum over `reps`, which on a part with no scheduler and no interrupts
+  ## is very nearly the only value observed. CYCCNT is 32-bit and wraps every
+  ## 53 seconds at 80 MHz; unsigned subtraction is correct across the wrap.
+  var best = high(uint32)
+  for _ in 0 ..< reps:
+    let t0 = boardCycles()
+    body
+    let t1 = boardCycles()
+    var d = t1 - t0
+    d = (if d > cycleOverhead: d - cycleOverhead else: 0'u32)
+    if d < best: best = d
+  best
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# INPUT AND INTEGRITY
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc fillInput() =
+  ## Byte-for-byte the host harness's input, so the checksum below is
+  ## comparable against a host run of the same model.
+  let inp = model.input0()
+  var s = 12345'u32
+  for i in 0 ..< model.Input0Elems:
+    s = s * 1664525'u32 + 1013904223'u32
+    inp[i] = int8(int32((s shr 16) and 0xFF'u32) - 128'i32)
+
+proc outputChecksum(): uint32 =
+  ## FNV-1a over the output bytes. Without this the benchmark cannot tell a
+  ## fast kernel from a kernel the linker deleted, and a firmware that
+  ## computes nothing is very fast indeed.
+  let outp = model.output0()
+  result = 0x811c9dc5'u32
+  for i in 0 ..< model.Output0Elems:
+    result = (result xor uint32(cast[uint8](outp[i]))) * 0x01000193'u32
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# RUN
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+const
+  WholeReps = 3
+  OpReps = 3
+
+proc runOnce(prefetch, icache, dcache: cint) =
+  boardFlashCache(prefetch, icache, dcache)
+
+  fillInput()
+  model.invoke()
+  let sum = outputChecksum()
+
+  fillInput()
+  let whole = measure(WholeReps, model.invoke())
+
+  put("config prefetch=")
+  putU(uint32(prefetch))
+  put(" icache=")
+  putU(uint32(icache))
+  put(" dcache=")
+  putU(uint32(dcache))
+  put(" acr=")
+  putHex(boardFlashAcr())
+  nl()
+
+  put("checksum ")
+  putHex(sum)
+  nl()
+
+  put("whole ")
+  putU(whole)
+  nl()
+
+  # Per operator. The op is driven directly, out of the sequence `invoke`
+  # would use, which computes nonsense and costs exactly what real data costs:
+  # these kernels branch on shapes, not on values.
+  fillInput()
+  for i in 0 ..< model.OpCount:
+    let c = measure(OpReps, model.invokeOp(i))
+    put("op ")
+    putU(uint32(i))
+    boardPutc(' ')
+    putU(c)
+    nl()
+
+proc steady_mcu_main() {.exportc, cdecl.} =
+  calibrateOverhead()
+
+  while true:
+    boardLed(1)
+    put("BEGIN ")
+    put(model.ModelName)
+    nl()
+    put("nonce ")
+    put(steadyNonce)
+    nl()
+    put("sysclk ")
+    putU(boardSysclk())
+    nl()
+    put("arena ")
+    putU(uint32(model.ArenaSize))
+    nl()
+    put("macs ")
+    putU(uint32(model.TotalMacs))
+    nl()
+    put("ops ")
+    putU(uint32(model.OpCount))
+    nl()
+    put("overhead ")
+    putU(cycleOverhead)
+    nl()
+
+    # The sweep: everything on, then each accelerator removed in turn. The
+    # last row is the honest cacheless number, which is the one this project's
+    # target class actually has.
+    runOnce(1, 1, 1)
+    runOnce(1, 1, 0)
+    runOnce(0, 0, 0)
+
+    put("END")
+    nl()
+    boardLed(0)
+
+    # Long enough that a host attaching mid-record gets a clean one next time.
+    for _ in 0 ..< 8_000_000:
+      asm """ "nop" """

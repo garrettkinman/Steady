@@ -77,7 +77,7 @@ suite "profiling entry points":
 
     var counted = 0
     for p in model.OpProfiles:
-      if p.kind in ["okConv2d", "okDepthwiseConv2d", "okFullyConnected"]:
+      if $p.kind in ["okConv2d", "okDepthwiseConv2d", "okFullyConnected"]:
         check p.macs > 0
         counted += p.macs
       else:

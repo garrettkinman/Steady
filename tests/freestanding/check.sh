@@ -82,7 +82,13 @@ echo "==> Image size"
 arm-none-eabi-size image.elf
 
 echo "==> Allocator audit"
-if arm-none-eabi-nm image.elf | grep -iE " (T|t|W) .*(malloc|calloc|realloc|_sbrk|newObj|nimGC)"; then
+# The symbol table is dumped to a file rather than piped: `nm | grep -q` under
+# `set -o pipefail` fails whenever grep matches early enough to exit before nm
+# finishes writing, because nm then dies of SIGPIPE and supplies the
+# pipeline's status. An audit that fails at random on a correct image is worse
+# than no audit.
+arm-none-eabi-nm image.elf > symbols.txt
+if grep -iqE " (T|t|W) .*(malloc|calloc|realloc|_sbrk|newObj|nimGC)" symbols.txt; then
   echo "FAIL: an allocator is reachable from the linked image"
   exit 1
 fi
@@ -91,23 +97,23 @@ echo "    no allocator linked in"
 echo "==> Placement audit"
 # Weights must be in .rodata (flash), the arena in .bss (RAM). Getting this
 # backwards is silent and expensive: it works, and it costs you all your RAM.
-if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_w_"; then
+if ! grep -qE "^0800.* R steady_.*_w_" symbols.txt; then
   echo "FAIL: weights are not in .rodata"
   exit 1
 fi
 echo "    weights in flash (.rodata)"
 # Activation tables are constants too, and are just as expensive to get wrong:
 # a 256-entry table copied into RAM at startup is 256 bytes of SRAM for nothing.
-if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_lut"; then
+if ! grep -qE "^0800.* R steady_.*_lut" symbols.txt; then
   echo "FAIL: activation tables are not in .rodata"
   exit 1
 fi
-if ! arm-none-eabi-nm image.elf | grep -qE "^0800.* R steady_.*_exp"; then
+if ! grep -qE "^0800.* R steady_.*_exp" symbols.txt; then
   echo "FAIL: the softmax exp table is not in .rodata"
   exit 1
 fi
 echo "    activation and exp tables in flash (.rodata)"
-if ! arm-none-eabi-nm image.elf | grep -qE "^2000.* B arena"; then
+if ! grep -qE "^2000.* B arena" symbols.txt; then
   echo "FAIL: arena is not in .bss"
   exit 1
 fi

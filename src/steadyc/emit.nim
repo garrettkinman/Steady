@@ -674,8 +674,12 @@ when defined(steadyProfile):
   ## `invoke`.
 
   type OpProfile* = object
-    name*: string
-    kind*: string
+    ## `cstring` rather than `string`: these are plain pointers into flash,
+    ## with no runtime behind them, so the table costs a freestanding build
+    ## nothing and an on-target profiler can print op names without linking
+    ## Nim's string machinery. Use `$name` on a host.
+    name*: cstring
+    kind*: cstring
     macs*: int          ## host-counted, padded taps included
     outElems*: int      ## output tensor size, the measure for data movement
 

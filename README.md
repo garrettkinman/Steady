@@ -534,6 +534,59 @@ Two other measurements worth recording, because both redirect effort:
 Runtime checks cost 4.4x, which is why the freestanding build uses `-d:danger`; on the target those
 checks are not merely slow, they have nothing to report to.
 
+### On the target itself
+
+`nimble mcu` builds a firmware image per model, flashes a B-L475E-IOT01A —
+STM32L475VG, Cortex-M4 at 80 MHz, 96 KB of usable SRAM, weights in internal
+flash — and reads per-operator **cycle counts** back over the ST-LINK's virtual
+COM port. Everything the host benchmark apologises for is absent: no scheduler,
+no other process, no frequency scaling, and no interrupt enabled anywhere in
+the image. Rerunning a measurement reproduces it to the cycle.
+
+It was worth the trouble, because the host was wrong about which changes
+mattered. `kws`, 2.66 MMAC, with the flash accelerators on:
+
+| kernels | flash `.text` | per inference | | |
+|---|---|---|---|---|
+| before | 36808 | 1169.8 ms | 35.2 cyc/MAC | |
+| blocked | 37948 | 753.8 ms | 22.7 cyc/MAC | 1.55x |
+| blocked, unrolled at compile time | 38700 | **539.2 ms** | **16.2 cyc/MAC** | **2.17x** |
+
+and `vww`, MobileNetV1 at 96x96, 7.49 MMAC: **2892 ms to 1433 ms, 2.02x** —
+against 1.45x for the same change on x86-64.
+
+The middle row is the whole argument for owning a board. Blocking the kernels
+is worth 1.55x on target; unrolling the block loop *in the Nim source instead of
+leaving it to the C compiler* is worth a further **1.40x on the target and
+nothing at all on x86-64**. GCC unrolls that loop at `-O3` and declines at
+`-Os`, which is what the freestanding build uses, so the host said the change
+was free and the target said it was the largest single win available. Reading
+the disassembly is what found it; the board is what priced it. See `unrolled` in
+[`kernels/reference.nim`](src/steady/kernels/reference.nim).
+
+Two more things the target says and the host cannot:
+
+- **The flash accelerators are worth more than the kernels.** Prefetch plus the
+  instruction and data caches take `kws` from 1137 ms to 539 ms — 2.1x, larger
+  than everything above. The benchmark sweeps them rather than assuming a
+  configuration, and reports the cacheless row too, because that is what parts
+  without them actually do. The earlier worry that four interleaved weight
+  streams would thrash an 8-line data cache did not survive contact: enabling
+  the data cache is worth 21% on `kws` *with* the blocked kernels.
+- **Depthwise convolution costs 70 cycles per MAC against convolution's 28.**
+  Same ratio the host profile shows, on a machine with no cache at all, which
+  settles that it is a property of the operator rather than of x86.
+
+The output checksum is the same on both machines — `6962079d` for `vww` from
+the Cortex-M4 and from the host benchmark, `ab2fdbf1` for `kws` — and the same
+before and after the kernel work, and the same in all three flash
+configurations. A benchmark that cannot tell a fast kernel from a kernel the
+linker deleted is measuring its own optimizer, so the firmware checksums its
+output and the harness refuses a record whose per-build nonce does not match the
+image it just flashed. Both of those exist because the first version of this
+harness reported two different kernels as identical to the digit, which is what
+a stale line in a serial buffer looks like.
+
 ### What was changed, and why it is still bit-exact
 
 Four transforms, all in [`kernels/reference.nim`](src/steady/kernels/reference.nim), all expressed
@@ -623,7 +676,7 @@ units to hide the transforms. That is a different machine from the one this comp
 ### What is left, in order
 
 1. **Data layout plus SIMD, through a vendor backend.** Still the single biggest factor, and now the
-   only large one left in reach. On Cortex-M4/M7 `SMLAD` does two int8 MACs per cycle, on M55/M85
+   only large one left in reach — and now measurable on the target rather than argued for. On Cortex-M4/M7 `SMLAD` does two int8 MACs per cycle, on M55/M85
    Helium does sixteen; both need weights arranged so the inner loop reads contiguous pairs or quads.
    Published CMSIS-NN figures are around 4-5x over reference kernels, and that is a *layout* result as
    much as an instruction-selection one — which is exactly the split between
@@ -633,9 +686,11 @@ units to hide the transforms. That is a different machine from the one this comp
    faster. In a vendor backend this is vector fixed-point arithmetic; portably it is a handful of
    instructions per output element that have to keep two different gemmlowp tie rules exactly right.
 3. **Depthwise blocked over pixels**, keeping a channel's weights in registers across several output
-   positions. Depthwise is memory-bound, the profile says so numerically, and this is the transform
-   that addresses loads rather than multiplies — but see the pixel-tiling result above before assuming
-   it will show up on x86.
+   positions. Depthwise is memory-bound — 70 cycles per MAC against convolution's 28 on the M4 — and
+   this is the transform that addresses loads rather than multiplies. The pixel-tiling result above
+   is the reason to try it on the board first: that one was worth 2% on x86 and was dropped, and the
+   host would have said the same about the compile-time unroll, which turned out to be worth 1.40x
+   on target.
 
 Block widths are `OcBlock`, `DwBlock` and `FcBlock` in
 [`kernels/reference.nim`](src/steady/kernels/reference.nim), all four here. Four beat two by about
@@ -657,6 +712,7 @@ nimble fetch          # download the checksummed .tflite fixtures
 nimble models         # differential harness against TFLite's reference kernels
 nimble ci             # all of the above
 nimble bench          # per-operator benchmark on the same models
+nimble mcu            # the same models on a Cortex-M4, in cycles
 ```
 
 `bench` is deliberately not part of `ci`: a timing is not a pass or a fail, and a number measured on
@@ -666,6 +722,18 @@ a shared build machine is not worth failing a build over.
 one model name to work on a single one (`tests/bench/check.sh vww`), writes a per-operator TSV to
 `build/bench/<model>/` for diffing two revisions of a kernel, and adds the `-d:release` column with
 `STEADY_BENCH_RELEASE=1`.
+
+`mcu` needs `arm-none-eabi-gcc`, `pyocd`, and a B-L475E-IOT01A on USB; it reports cycles rather than
+milliseconds and sweeps the flash accelerators. The probe needs a udev rule to be usable without
+root:
+
+```
+SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", MODE="0666", TAG+="uaccess"
+```
+
+Porting it to another Cortex-M part is [`tests/mcu/board.c`](tests/mcu/board.c) and
+[`stm32l475.ld`](tests/mcu/stm32l475.ld) — a clock, a UART, a 32-bit timer and a memory map, about a
+hundred lines with no vendor HAL.
 
 `freestanding` needs `arm-none-eabi-gcc`; `models` needs the fixtures and a reference interpreter:
 
@@ -706,8 +774,10 @@ Done:
 - [x] Differential harness against TFLite's reference kernels on five real int8 models
 - [x] Benchmark task with per-operator attribution, and the portable structural work it justified —
       a 1x1 fast path, output-channel and depthwise-channel blocking, fully-connected row blocking:
-      1.1x to 1.8x per model with the bit-exactness unchanged, digit for digit. See
-      [Kernel performance](#kernel-performance).
+      1.1x to 1.8x per model on x86-64 and up to 2.2x on a Cortex-M4, with the bit-exactness
+      unchanged, digit for digit. See [Kernel performance](#kernel-performance).
+- [x] On-target benchmark on real hardware: cycle counts per operator from an STM32L475, with the
+      flash accelerators as a swept variable and the output checksum matching the host's
 
 Next, roughly in order:
 

@@ -58,6 +58,11 @@ task staticlib, "Package a model as a C static library and consume it from C":
 task fetch, "Download the real .tflite fixtures (checksummed)":
   exec "bash tests/models/fetch.sh"
 
+task mcu, "On-target benchmark: real models on a Cortex-M4, in cycles":
+  # Skips itself, loudly, without arm-none-eabi-gcc, pyocd, or a board — see
+  # tests/mcu/check.sh.
+  exec "bash tests/mcu/check.sh"
+
 task bench, "Per-operator benchmark on the real models":
   # Skips itself, loudly, when the fixtures are absent — see
   # tests/bench/check.sh. Needs no reference interpreter: this measures time,

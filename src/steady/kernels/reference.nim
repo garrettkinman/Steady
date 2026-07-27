@@ -25,9 +25,43 @@
 ## policy-agnostic, and the inner loop stays branch-free, which on a
 ## cacheless part is often faster than the bounds test it replaces.
 
+import std/macros
 import ../policy
 
 export policy
+
+macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
+  ## `for idx in 0 ..< n`, expanded here rather than left to the C compiler:
+  ## `n` copies of `body`, with `idx` a literal constant in each.
+  ##
+  ## This exists because of a measurement, not a preference. The blocked
+  ## kernels below keep their accumulators in a small `array[Blk, Accum(P)]`,
+  ## which is only ever a win if those elements end up in registers. An
+  ## ordinary `for` loop over a constant range compiles to a C loop with a
+  ## variable index, and whether that gets unrolled — and the array promoted to
+  ## registers with it — is the C compiler's decision. GCC makes it at `-O3`
+  ## and declines at `-Os`, which is what the freestanding build uses:
+  ##
+  ##   ldr    r1, [r7, #0]      ; acc[k], from the stack
+  ##   smlabb r1, ip, r9, r1    ; the one instruction that does the work
+  ##   str.w  r1, [r7], #4      ; and back to the stack
+  ##
+  ## Nine instructions per multiply-accumulate against seven for the unblocked
+  ## path, on the exact target this compiler is for. With literal indices the
+  ## array is trivially promotable and the same loop keeps its accumulators in
+  ## registers at `-Os`.
+  ##
+  ## `macros` runs on the build machine and emits no code of its own, so this
+  ## costs the target nothing and keeps the "nothing at all on the target"
+  ## rule intact.
+  result = newStmtList()
+  for i in 0 ..< n:
+    result.add nnkBlockStmt.newTree(
+      newEmptyNode(),
+      newStmtList(
+        nnkConstSection.newTree(
+          nnkConstDef.newTree(idx, newEmptyNode(), newLit(i))),
+        copyNimTree(body)))
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BLOCKING
@@ -106,12 +140,12 @@ proc fullyConnected*[P, S, B, PT](
 
   template rows(Blk: static int, o: int) =
     var acc: array[Blk, Accum(P)]
-    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
+    unrolled k, Blk: acc[k] = zeroAccum(P)
     for i in 0 ..< inDim:
       let v = x[i]
-      for k in 0 ..< Blk:
+      unrolled k, Blk:
         mac(P, acc[k], w[(o + k) * inDim + i], v)
-    for k in 0 ..< Blk:
+    unrolled k, Blk:
       addBias(P, acc[k], bias[o + k])
       y[o + k] = finish(P, acc[k], prm, o + k)
 
@@ -168,13 +202,13 @@ proc conv2d*[P, S, B, PT](
     ## `Blk` filters over one output pixel. Each accumulator sees the same taps
     ## in the same order as the unblocked kernel: ky, then kx, then ic.
     var acc: array[Blk, Accum(P)]
-    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
+    unrolled k, Blk: acc[k] = zeroAccum(P)
 
     when pointwise:
       let xBase = (inYOrigin * inW + inXOrigin) * inC
       for ic in 0 ..< inC:
         let v = x[xBase + ic]
-        for k in 0 ..< Blk:
+        unrolled k, Blk:
           mac(P, acc[k], w[(oc + k) * filterSize + ic], v)
     else:
       for ky in 0 ..< kH:
@@ -187,14 +221,14 @@ proc conv2d*[P, S, B, PT](
             let xBase = (iy * inW + ix) * inC
             for ic in 0 ..< inC:
               let v = x[xBase + ic]
-              for k in 0 ..< Blk:
+              unrolled k, Blk:
                 mac(P, acc[k], w[(oc + k) * filterSize + wBase + ic], v)
           else:
             for ic in 0 ..< inC:
-              for k in 0 ..< Blk:
+              unrolled k, Blk:
                 mac(P, acc[k], w[(oc + k) * filterSize + wBase + ic], padValue)
 
-    for k in 0 ..< Blk:
+    unrolled k, Blk:
       addBias(P, acc[k], bias[oc + k])
       y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
 
@@ -273,7 +307,7 @@ proc depthwiseConv2d*[P, S, B, PT](
     ## `Blk` channels over one output pixel, each accumulator seeing its taps
     ## in the original ky-then-kx order.
     var acc: array[Blk, Accum(P)]
-    for k in 0 ..< Blk: acc[k] = zeroAccum(P)
+    unrolled k, Blk: acc[k] = zeroAccum(P)
     let ic0 = oc div depthMultiplier      # == oc whenever Blk > 1
 
     for ky in 0 ..< kH:
@@ -284,13 +318,13 @@ proc depthwiseConv2d*[P, S, B, PT](
         let wBase = (ky * kW + kx) * outC + oc
         if rowInside and ix >= 0 and ix < inW:
           let xBase = (iy * inW + ix) * inC + ic0
-          for k in 0 ..< Blk:
+          unrolled k, Blk:
             mac(P, acc[k], w[wBase + k], x[xBase + k])
         else:
-          for k in 0 ..< Blk:
+          unrolled k, Blk:
             mac(P, acc[k], w[wBase + k], padValue)
 
-    for k in 0 ..< Blk:
+    unrolled k, Blk:
       addBias(P, acc[k], bias[oc + k])
       y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
 
