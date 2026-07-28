@@ -238,10 +238,11 @@ on every channel where the two disagree (mean error 0.4805 against TFLite's 0.51
 ## Performance
 
 Measured where it matters: on the part. `nimble mcu` builds a firmware image per model, flashes a
-B-L475E-IOT01A (STM32L475VG, Cortex-M4 at 80 MHz, 96 KB usable SRAM, weights in internal flash) and
-reads per-operator **cycle counts** back over the ST-LINK's virtual COM port — no scheduler, no other
-process, no frequency scaling, no interrupt enabled anywhere in the image. Rerunning a measurement
-reproduces it to the cycle.
+board and reads per-operator **cycle counts** back over its console — no scheduler, no other process,
+no frequency scaling, no interrupt enabled anywhere in the image. Rerunning a measurement reproduces
+it to the cycle. The reference board is a B-L475E-IOT01A (STM32L475VG, Cortex-M4 at 80 MHz, 96 KB
+usable SRAM, weights in internal flash); a second part is
+[below](#the-same-compiler-on-a-second-part).
 
 MAC counts come from the compiler's own `macCount`, padded taps included, since those are multiplied
 against `padValue` rather than skipped. Arena and flash are the compiler's own report. Cycles are
@@ -249,20 +250,47 @@ with the flash accelerators on, which is the configuration a real product would 
 
 | model | arena | flash | MMAC | cycles | ms | cyc/MAC | MMAC/s |
 |---|---|---|---|---|---|---|---|
-| `ad` | 768 B | 265 KB | 0.26 | 2,413,033 | 30.2 | 9.13 | 8.8 |
-| `resnet8` | 48 KB | 77 KB | 12.50 | 149,355,933 | 1867.0 | 11.95 | 6.7 |
-| `vww` | 63 KB | 214 KB | 7.49 | 114,641,853 | 1433.0 | 15.31 | 5.2 |
-| `person_detect` | 54 KB | 214 KB | 7.16 | 112,707,736 | 1408.9 | 15.75 | 5.1 |
-| `kws` | 16 KB | 24 KB | 2.66 | 43,135,898 | 539.2 | 16.24 | 4.9 |
-| `fomo` | 78 KB | 19 KB | 5.40 | 103,205,961 | 1290.1 | 19.11 | 4.2 |
+| `ad` | 768 B | 265 KB | 0.26 | 2,413,782 | 30.2 | 9.14 | 8.8 |
+| `resnet8` | 48 KB | 77 KB | 12.50 | 149,371,445 | 1867.1 | 11.95 | 6.7 |
+| `vww` | 63 KB | 214 KB | 7.49 | 114,544,319 | 1431.8 | 15.29 | 5.2 |
+| `person_detect` | 54 KB | 214 KB | 7.16 | 112,660,040 | 1408.3 | 15.74 | 5.1 |
+| `kws` | 16 KB | 24 KB | 2.66 | 43,169,869 | 539.6 | 16.25 | 4.9 |
+| `fomo` | 78 KB | 19 KB | 5.40 | 103,255,958 | 1290.7 | 19.12 | 4.2 |
 
 FOMO is the interesting row: a real object detector in 78 KB of RAM and 19 KB of flash. MobileNetV2
 is absent because it does not fit — 1.5 MB of arena against 96 KB of SRAM — and stays in the
 correctness suite rather than this one.
 
+### The same compiler on a second part
+
+`--board samd51` runs the same six on an Adafruit ItsyBitsy M4 Express — ATSAMD51G19A, the same
+Cortex-M4 at 120 MHz with 192 KB of SRAM and a 4 KB unified cache, reached over nothing but a USB
+cable. Cycles with everything enabled:
+
+| model | MMAC | cycles | ms | cyc/MAC | MMAC/s | vs STM32, cycles |
+|---|---|---|---|---|---|---|
+| `ad` | 0.26 | 2,375,122 | 19.8 | 8.99 | 13.3 | 0.98x |
+| `resnet8` | 12.50 | 145,826,568 | 1215.2 | 11.66 | 10.3 | 0.98x |
+| `vww` | 7.49 | 111,497,163 | 929.1 | 14.89 | 8.1 | 0.97x |
+| `person_detect` | 7.16 | 110,233,310 | 918.6 | 15.40 | 7.8 | 0.98x |
+| `kws` | 2.66 | 42,421,704 | 353.5 | 15.97 | 7.5 | 0.98x |
+| `fomo` | 5.40 | 99,481,577 | 829.0 | 18.42 | 6.5 | 0.96x |
+
+The last column is the point. Two parts with different vendors, different flash controllers and
+different things in front of flash land within 2–4% of each other **in cycles** — so the wall-clock
+difference is very nearly just the clock ratio, and the ranking of the models is identical. That is
+the result worth having from a second board: it says the numbers in the table above are a property of
+these kernels on this core, not of one vendor's memory system.
+
+Where the two genuinely differ is how much that memory system is worth. The SAMD51's 4 KB cache is
+**3.05x on `kws`** against no cache at all, where the STM32's prefetch buffer and two caches are 2.1x;
+its cacheless row is correspondingly worse (48.8 cyc/MAC against 34.4), because five flash wait states
+at 120 MHz with nothing in front of them is what that costs. Every output checksum is identical on
+the two parts, which is the claim the whole compiler rests on and now has two witnesses.
+
 The kernel work in [docs/performance.md](docs/performance.md) is worth **2.17x on `kws`** and
 **2.02x on `vww`** against the unoptimized reference kernels, and the flash accelerators are worth
-more again — prefetch plus both caches take `kws` from 1137 ms to 539 ms. The harness sweeps them
+more again — prefetch plus both caches take `kws` from 1141 ms to 540 ms. The harness sweeps them
 rather than assuming a configuration, and reports the cacheless row too, because that is what parts
 without them actually do.
 
@@ -306,16 +334,34 @@ nimble fetch                                    # five published models
 .venv/bin/python tests/models/convert.py        # mobilenet_v2 and fomo
 ```
 
-`mcu` needs `arm-none-eabi-gcc`, `pyocd`, and a B-L475E-IOT01A on USB. The probe needs a udev rule to
-be usable without root:
+`mcu` needs `arm-none-eabi-gcc` and a board on USB. Two are supported, it reports which one it found
+rather than assuming, and with both attached it asks — their numbers are not comparable:
+
+| `--board` | part | how it is reached |
+|---|---|---|
+| `stm32l475` | STM32L475VG @ 80 MHz, 96 KB SRAM (B-L475E-IOT01A) | ST-LINK, via `pyocd` |
+| `samd51` | ATSAMD51G19A @ 120 MHz, 192 KB SRAM (Adafruit ItsyBitsy M4 Express) | its own USB |
+
+The ST-LINK needs `pyocd` and a udev rule to be usable without root:
 
 ```
 SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", MODE="0666", TAG+="uaccess"
 ```
 
-Porting it to another Cortex-M part is [tests/mcu/board.c](tests/mcu/board.c) and
-[tests/mcu/stm32l475.ld](tests/mcu/stm32l475.ld) — a clock, a UART, a 32-bit timer and a memory map,
-about a hundred lines with no vendor HAL.
+The ItsyBitsy needs neither, and nothing but the cable: it is flashed by copying a UF2 onto its
+bootloader's mass-storage volume, and the harness asks for that bootloader the way every
+Arduino-compatible board does, by opening the port at 1200 baud and dropping DTR. It has no debug
+probe and no USB-serial bridge, so the firmware serves its own CDC console —
+[tests/mcu/boards/samd51/usb_cdc.c](tests/mcu/boards/samd51/usb_cdc.c), polled rather than
+interrupt-driven, because an interrupt landing inside a measured region is exactly the noise a cycle
+counter is supposed to be free of. An image that fails to enumerate hands itself back to the
+bootloader after a minute, which is what keeps a bad build from being unrecoverable on a part with no
+other way in.
+
+Porting to a third is [tests/mcu/boards/](tests/mcu/boards/): a `board.c` implementing the entry
+points the benchmark calls, a linker script, and a `board.sh` saying how to find the board and get an
+image onto it. A clock, a console, a 32-bit counter, a memory map and whatever sits in front of flash
+— no vendor HAL in either of the two that exist.
 
 Every optional check skips itself, loudly, when its dependency is missing. A missing tool is not a
 failure, but quietly reporting success would be.
@@ -347,6 +393,9 @@ Done:
 - [x] Differential harness against TFLite's reference kernels on seven real int8 models
 - [x] On-target benchmark on real hardware: per-operator cycle counts from an STM32L475, with the
       flash accelerators as a swept variable and a per-build nonce the harness refuses to mismatch
+- [x] A second board behind the same harness — an ATSAMD51G19A reached over nothing but USB, with a
+      polled CDC console the firmware serves itself so that no interrupt exists to land inside a
+      measurement. Same checksums, and cycle counts within 4% of the first part's
 - [x] The portable kernel work that benchmark justified: up to 2.2x on a Cortex-M4, with the
       bit-exactness unchanged, digit for digit
 

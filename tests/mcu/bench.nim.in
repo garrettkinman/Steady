@@ -10,21 +10,25 @@
 ##
 ## This is the only benchmark in the project, and the reason it can be. There
 ## is no scheduler, no other process, no frequency scaling and no interrupt
-## enabled anywhere in the image, so `DWT->CYCCNT` counts exactly the cycles
-## the kernel spent and counts the same number every run. Proving that a 3%
-## difference is real — the awkward part of timing anything on a desktop — is
-## not a problem this file has.
+## enabled anywhere in the image, so the board's cycle counter counts exactly
+## the cycles the kernel spent and counts the same number every run. Proving
+## that a 3% difference is real — the awkward part of timing anything on a
+## desktop — is not a problem this file has.
 ##
 ## What it does have is a memory system worth measuring: weights are read from
-## flash through a prefetch buffer, a 32-line instruction cache and an 8-line
-## data cache, all three switchable at runtime. The benchmark sweeps them
-## rather than assuming a configuration, because the answer to "is blocking
-## worth it" is allowed to depend on that and the point is to find out.
+## flash through whatever caching the part puts in front of it, switchable at
+## runtime. The benchmark sweeps that rather than assuming a configuration,
+## because the answer to "is blocking worth it" is allowed to depend on it and
+## the point is to find out.
 ##
-## Output is plain text over the ST-LINK virtual COM port, one record per line,
-## framed by BEGIN/END so a host reader can attach at any time. The whole run
-## repeats forever: a benchmark that has to be raced against a reset is a
-## benchmark that gets run once.
+## This file is board-independent, and deliberately: everything below goes
+## through ten `board_*` entry points, so a port is a C file and a linker
+## script rather than an edit here. Output is plain text on whatever console
+## the board provides — a UART into a debug probe on one, a USB CDC endpoint
+## the firmware serves itself on another — one record per line, framed by
+## BEGIN/END so a host reader can attach at any time. The whole run repeats
+## forever: a benchmark that has to be raced against a reset is a benchmark
+## that gets run once.
 ##
 ## Nothing here allocates, and nothing here uses a Nim `string` — the integer
 ## formatting is by hand for that reason. `nimble mcu` audits the image for
@@ -52,10 +56,32 @@ const steadyNonce* {.strdefine.} = "dev"
 proc boardPutc(c: char) {.importc: "board_putc", cdecl.}
 proc boardCycles(): uint32 {.importc: "board_cycles", cdecl.}
 proc boardSysclk(): uint32 {.importc: "board_sysclk", cdecl.}
+proc boardTimebase(): cstring {.importc: "board_timebase", cdecl.}
 proc boardLed(on: cint) {.importc: "board_led", cdecl.}
-proc boardFlashCache(prefetch, icache, dcache: cint)
-  {.importc: "board_flash_cache", cdecl.}
-proc boardFlashAcr(): uint32 {.importc: "board_flash_acr", cdecl.}
+proc boardPoll() {.importc: "board_poll", cdecl.}
+  ## Called between measured regions, never inside one.
+  ##
+  ## A board whose console is a peripheral the firmware drives itself has to
+  ## drive it, and this image has no interrupts on purpose — so the console
+  ## goes unserviced for exactly as long as the thing being measured takes.
+  ## That is invisible on a UART, whose bridge chip does not care, and very
+  ## visible on USB, where the host's own driver asks the device questions and
+  ## blocks its caller until they are answered: a `stty` on the port wedged for
+  ## minutes behind one three-repetition measurement of `fomo`.
+  ##
+  ## Polling here bounds that wait by a single repetition instead of a whole
+  ## record. It is outside `t0`..`t1` by construction, so it is not in any
+  ## number this file reports.
+proc boardCacheConfigs(): cint {.importc: "board_cache_configs", cdecl.}
+proc boardCacheLabel(i: cint): cstring {.importc: "board_cache_label", cdecl.}
+proc boardCacheSelect(i: cint) {.importc: "board_cache_select", cdecl.}
+proc boardCacheState(): uint32 {.importc: "board_cache_state", cdecl.}
+  ## What sits in front of flash is the board's business, not this file's: it
+  ## asks how many configurations there are, applies each in turn and prints
+  ## the label the board hands back. An STM32L4 has a prefetch buffer and two
+  ## caches; a SAMD51 has a 4 KB unified cache and a pair of NVM read buffers.
+  ## Neither vocabulary belongs in a benchmark that is supposed to survive the
+  ## next part.
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # OUTPUT
@@ -109,10 +135,12 @@ proc calibrateOverhead() =
 
 template measure(reps: int, body: untyped): uint32 =
   ## Minimum over `reps`, which on a part with no scheduler and no interrupts
-  ## is very nearly the only value observed. CYCCNT is 32-bit and wraps every
-  ## 53 seconds at 80 MHz; unsigned subtraction is correct across the wrap.
+  ## is very nearly the only value observed. The counter is 32 bits and wraps
+  ## in tens of seconds at these clocks — 53 at 80 MHz, 36 at 120 — so the
+  ## subtraction is unsigned, which is correct across the wrap.
   var best = high(uint32)
   for _ in 0 ..< reps:
+    boardPoll()
     let t0 = boardCycles()
     body
     let t1 = boardCycles()
@@ -151,8 +179,8 @@ const
   WholeReps = 3
   OpReps = 3
 
-proc runOnce(prefetch, icache, dcache: cint) =
-  boardFlashCache(prefetch, icache, dcache)
+proc runOnce(cfg: cint) =
+  boardCacheSelect(cfg)
 
   fillInput()
   model.invoke()
@@ -161,14 +189,10 @@ proc runOnce(prefetch, icache, dcache: cint) =
   fillInput()
   let whole = measure(WholeReps, model.invoke())
 
-  put("config prefetch=")
-  putU(uint32(prefetch))
-  put(" icache=")
-  putU(uint32(icache))
-  put(" dcache=")
-  putU(uint32(dcache))
-  put(" acr=")
-  putHex(boardFlashAcr())
+  put("config ")
+  put(boardCacheLabel(cfg))
+  put(" raw=")
+  putHex(boardCacheState())
   nl()
 
   put("checksum ")
@@ -205,6 +229,9 @@ proc steady_mcu_main() {.exportc, cdecl.} =
     put("sysclk ")
     putU(boardSysclk())
     nl()
+    put("timebase ")
+    put(boardTimebase())
+    nl()
     put("arena ")
     putU(uint32(model.ArenaSize))
     nl()
@@ -218,12 +245,11 @@ proc steady_mcu_main() {.exportc, cdecl.} =
     putU(cycleOverhead)
     nl()
 
-    # The sweep: everything on, then each accelerator removed in turn. The
-    # last row is the honest cacheless number, which is the one this project's
-    # target class actually has.
-    runOnce(1, 1, 1)
-    runOnce(1, 1, 0)
-    runOnce(0, 0, 0)
+    # The sweep, as the board defines it. Its last row is by convention the
+    # one with everything switched off, which is the honest number for a part
+    # with no accelerators in front of flash at all.
+    for cfg in 0 ..< boardCacheConfigs():
+      runOnce(cfg)
 
     put("END")
     nl()

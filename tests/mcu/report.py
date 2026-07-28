@@ -79,6 +79,8 @@ def main():
         key = parts[0]
         if key in ("sysclk", "arena", "macs", "ops", "overhead"):
             header[key] = int(parts[1])
+        elif key == "timebase":
+            header[key] = parts[1]
         elif key == "config":
             cur = {"label": " ".join(parts[1:]), "ops": {}}
             configs.append(cur)
@@ -89,12 +91,23 @@ def main():
         elif key == "op" and cur is not None:
             cur["ops"][int(parts[1])] = int(parts[2])
 
+    # A record is framed by BEGIN and END, which says the firmware got from one
+    # to the other — not that every line in between survived the wire. On a
+    # board whose console is a USB endpoint the firmware serves itself, a
+    # dropped packet would produce a record that still parses and is quietly
+    # missing operators, so the count the device announced is checked against
+    # the number of rows that actually arrived.
+    for c in configs:
+        if len(c["ops"]) != header.get("ops", len(c["ops"])):
+            sys.exit(f"record is short: {header['ops']} operators announced, "
+                     f"{len(c['ops'])} received in '{c['label']}'")
+
     hz = header.get("sysclk", 80_000_000)
     macs = header.get("macs", 0)
     print(f"    {header.get('ops', 0)} ops   {macs / 1e6:.2f} MMAC   "
           f"arena {header.get('arena', 0)} bytes   "
-          f"{hz / 1e6:.0f} MHz   measurement overhead "
-          f"{header.get('overhead', 0)} cycles")
+          f"{hz / 1e6:.0f} MHz   {header.get('timebase', '?')} "
+          f"overhead {header.get('overhead', 0)} cycles")
 
     # Whole-model, one row per flash-accelerator configuration. The last row is
     # the cacheless number, which is the one the target class actually has.
