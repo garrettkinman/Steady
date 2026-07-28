@@ -4,42 +4,79 @@
 # This software is released under the MIT License.
 # https://opensource.org/licenses/MIT
 #
-# On-target benchmark: build a firmware image per model, flash a
-# B-L475E-IOT01A over its ST-LINK, and read per-operator cycle counts back
-# over the virtual COM port.
+# On-target benchmark: build a firmware image per model, flash a board over
+# USB, and read per-operator cycle counts back over its console.
 #
 # This is the only benchmark in the project, deliberately. Timing these models
 # on a desktop core measures an out-of-order superscalar with megabytes of
-# cache and other processes on it; the target is an 80 MHz Cortex-M4 reading
-# its weights from flash through an 8-line data cache. Which kernel is faster
+# cache and other processes on it; the target is a Cortex-M4 reading its
+# weights from flash through a few kilobytes of cache. Which kernel is faster
 # is allowed to differ between them, and has — so the proxy was removed rather
 # than kept alongside. See docs/performance.md.
 #
-#   tests/mcu/check.sh              every model that fits
-#   tests/mcu/check.sh kws vww      just these
+#   tests/mcu/check.sh                        every model that fits
+#   tests/mcu/check.sh kws vww                just these
+#   tests/mcu/check.sh --board samd51 kws     on a named board
 #
 # Needs arm-none-eabi-gcc and a board. Skips itself, loudly, without either.
 #
-# Flashing and reset go through pyocd, which knows this board by name. The
-# ST-LINK's drag-and-drop mass storage also works and needs no tools at all,
-# but it cannot reset on demand, cannot read a register back, and cannot tell
-# you that your stack pointer is in unmapped memory — which is how the first
-# bring-up of this file was spent. Results come back over /dev/ttyACM0 at
-# 115200.
+# ~~ adding a board ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Everything part-specific lives under boards/<name>/, and everything above is
+# shared. A port is three files.
+#
+# board.c, implementing what bench.nim.in calls and startup.c needs:
+#
+#   board_init        clock, console, counter; called before anything else
+#   board_putc        one character to the console
+#   board_poll        service the console; called between measured regions
+#   board_led         a liveness signal, or nothing
+#   board_cycles      a 32-bit counter ticking once per core cycle
+#   board_sysclk      how many of those there are in a second
+#   board_timebase    what that counter is, for the record
+#   board_cache_configs / _label / _select / _state
+#                     the sweep in front of flash, in this part's own terms
+#
+# a linker script, and a board.sh defining
+#
+#   BOARD_LABEL       what to print
+#   BOARD_MCPU        architecture flags for the cross compiler
+#   BOARD_SOURCES     C files in the board directory, space separated
+#   BOARD_LD          linker script in the board directory
+#   BOARD_RODATA_RE   what a flash address looks like in `nm` output, so the
+#                     placement audit can tell flash from RAM on this part
+#   board_probe       0 if the board is usable, else a printed reason
+#   board_console     the path to read records from
+#   board_flash       program $1/image.elf (or image.bin) onto it
+#
+# The two that exist differ about as much as two Cortex-M4s can — one is
+# programmed through a debug probe and talks over a bridge chip's UART, the
+# other is programmed by copying a file onto a bootloader's mass-storage
+# volume and talks over a CDC endpoint its own firmware implements — and
+# neither fact reaches any file above this line.
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIR="$ROOT/tests/mcu"
 BUILD="$ROOT/build/mcu"
-TTY="${STEADY_MCU_TTY:-/dev/ttyACM0}"
 
-# Only models whose arena fits 96 KB of SRAM1 and whose weights fit 1 MB of
-# flash. mobilenet_v2 needs a 1.5 MB arena and is not a candidate on any part
-# this compiler targets.
+BOARD="${STEADY_MCU_BOARD:-}"
+MODELS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --board) BOARD="$2"; shift 2 ;;
+    --board=*) BOARD="${1#*=}"; shift ;;
+    -h|--help) sed -n '7,21p' "${BASH_SOURCE[0]}" | sed 's/^# \?//'; exit 0 ;;
+    *) MODELS+=("$1"); shift ;;
+  esac
+done
+
+# Only models whose arena fits the smaller board's SRAM and whose weights fit
+# its flash. mobilenet_v2 needs a 1.5 MB arena and is not a candidate on any
+# part this compiler targets.
 DEFAULT_MODELS="kws resnet8 vww person_detect fomo ad"
-MODELS=("${@:-}")
-if [ -z "${MODELS[0]:-}" ]; then
+if [ ${#MODELS[@]} -eq 0 ]; then
   read -r -a MODELS <<<"${STEADY_MCU_MODELS:-$DEFAULT_MODELS}"
 fi
 
@@ -48,33 +85,59 @@ if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then
   exit 0
 fi
 
-PYOCD="${STEADY_MCU_PYOCD:-pyocd}"
-command -v "$PYOCD" >/dev/null 2>&1 || PYOCD="$ROOT/.venv/bin/pyocd"
-if ! command -v "$PYOCD" >/dev/null 2>&1; then
-  echo "==> pyocd not found; skipping the on-target benchmark"
-  echo "    pip install pyocd, and give the probe a udev rule:"
-  echo '    SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", MODE="0666", TAG+="uaccess"'
-  exit 0
-fi
-if ! "$PYOCD" list 2>/dev/null | grep -q stm32l475; then
-  echo "==> no B-L475E-IOT01A found by pyocd; skipping the on-target benchmark"
-  exit 0
-fi
-if [ ! -e "$TTY" ]; then
-  echo "==> $TTY not present; skipping the on-target benchmark"
-  echo "    set STEADY_MCU_TTY if the virtual COM port is elsewhere"
-  exit 0
+# ~~ pick a board ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+BOARDS=()
+for d in "$DIR"/boards/*/; do BOARDS+=("$(basename "$d")"); done
+
+if [ -n "$BOARD" ]; then
+  [ -f "$DIR/boards/$BOARD/board.sh" ] || {
+    echo "==> no such board '$BOARD'; have: ${BOARDS[*]}"
+    exit 1
+  }
+  # shellcheck disable=SC1090
+  source "$DIR/boards/$BOARD/board.sh"
+  if ! reason="$(board_probe)"; then
+    echo "==> $BOARD not usable; skipping the on-target benchmark"
+    [ -n "$reason" ] && echo "$reason"
+    exit 0
+  fi
+else
+  # Nothing named, so find out. Refusing when two are attached is not
+  # pedantry: numbers from two different parts are not comparable, and a table
+  # that silently changed which one it came from is worse than no table.
+  FOUND=(); REASONS=""
+  for b in "${BOARDS[@]}"; do
+    if ( source "$DIR/boards/$b/board.sh"; board_probe >/dev/null 2>&1 ); then
+      FOUND+=("$b")
+    else
+      REASONS+="$(source "$DIR/boards/$b/board.sh"; board_probe 2>&1 || true)"$'\n'
+    fi
+  done
+  if [ ${#FOUND[@]} -eq 0 ]; then
+    echo "==> no supported board found; skipping the on-target benchmark"
+    printf '%s' "$REASONS"
+    exit 0
+  fi
+  if [ ${#FOUND[@]} -gt 1 ]; then
+    echo "==> more than one supported board is attached: ${FOUND[*]}"
+    echo "    name one with --board <name>; their numbers are not comparable"
+    exit 1
+  fi
+  BOARD="${FOUND[0]}"
+  # shellcheck disable=SC1090
+  source "$DIR/boards/$BOARD/board.sh"
 fi
 
+BDIR="$DIR/boards/$BOARD"
 NIMLIB="$(nim --hints:off --eval:'import std/os; echo getCurrentCompilerExe().parentDir.parentDir / "lib"' 2>/dev/null | tail -1)"
 
 echo "==> Building the compiler"
 nim c --hints:off -d:release --path:"$ROOT/src" \
       --out:"$BUILD/steadyc" "$ROOT/src/steadyc.nim"
-echo "==> Target  STM32L475VG @ 80 MHz   console $TTY"
+echo "==> Target  $BOARD — $BOARD_LABEL"
 
-MCPU="-mcpu=cortex-m4 -mthumb -mfloat-abi=soft"
-CFLAGS="-c -Os -ffreestanding -ffunction-sections -fdata-sections -Wall $MCPU"
+CFLAGS="-c -Os -ffreestanding -ffunction-sections -fdata-sections -Wall $BOARD_MCPU"
 
 for name in "${MODELS[@]}"; do
   model="$ROOT/tests/models/$name.tflite"
@@ -82,7 +145,7 @@ for name in "${MODELS[@]}"; do
 
   echo
   echo "==> $name"
-  out="$BUILD/$name"
+  out="$BUILD/$BOARD/$name"
   rm -rf "$out"; mkdir -p "$out"
 
   # Identifies this build in the record it produces; see bench.nim.in.
@@ -103,11 +166,15 @@ for name in "${MODELS[@]}"; do
     for f in *.c; do arm-none-eabi-gcc $CFLAGS -w -I"$NIMLIB" -o "${f%.c}.o" "$f"; done )
   arm-none-eabi-gcc $CFLAGS -w -I"$NIMLIB" -o "$out/weights.o" "$out/${name}_weights.c"
   arm-none-eabi-gcc $CFLAGS -o "$out/startup.o" "$DIR/startup.c"
-  arm-none-eabi-gcc $CFLAGS -o "$out/board.o" "$DIR/board.c"
+  BOARD_OBJS=()
+  for src in $BOARD_SOURCES; do
+    arm-none-eabi-gcc $CFLAGS -o "$out/${src%.c}.o" "$BDIR/$src"
+    BOARD_OBJS+=("$out/${src%.c}.o")
+  done
 
   arm-none-eabi-gcc -o "$out/image.elf" \
-    "$out/startup.o" "$out/board.o" "$out/weights.o" "$out"/nimcache/*.o \
-    $MCPU -nostartfiles -T"$DIR/stm32l475.ld" \
+    "$out/startup.o" "${BOARD_OBJS[@]}" "$out/weights.o" "$out"/nimcache/*.o \
+    $BOARD_MCPU -nostartfiles -T"$BDIR/$BOARD_LD" \
     -Wl,--gc-sections -Wl,-Map="$out/image.map" \
     --specs=nosys.specs --specs=nano.specs
 
@@ -128,31 +195,53 @@ for name in "${MODELS[@]}"; do
     echo "FAIL: an allocator is reachable from the benchmark image"
     exit 1
   fi
-  if ! grep -qE "^0800.* R steady_.*_w_" "$out/symbols.txt"; then
+  if ! grep -qE "$BOARD_RODATA_RE.* R steady_.*_w_" "$out/symbols.txt"; then
     echo "FAIL: weights are not in flash"
     exit 1
   fi
   echo "    no allocator linked in; weights in flash"
 
-  echo "    flashing $(stat -c%s "$out/image.bin") bytes"
-  "$PYOCD" flash -t stm32l475xg "$out/image.elf" 2>&1 | tail -1 | sed 's/^/    /'
+  board_flash "$out"
+
+  if ! TTY="$(board_console)"; then
+    echo "FAIL: no console appeared after flashing (see $out/)"
+    exit 1
+  fi
+  echo "    console $TTY"
 
   # The firmware loops forever, so listening can start after programming
   # rather than racing it.
-  stty -F "$TTY" 115200 raw -echo -hupcl 2>/dev/null || true
+  #
+  # The line discipline is worth setting and not worth waiting forever for.
+  # On a board whose console is a USB CDC endpoint, `stty` is not a local
+  # operation: it sends a control request and blocks until the device answers,
+  # and this device answers between measurements — which on the largest model
+  # is seconds away. Unbounded, it wedged a whole run behind one measurement of
+  # `fomo`. The firmware now polls between repetitions, and this is the belt to
+  # that pair of braces.
+  timeout 15 stty -F "$TTY" 115200 raw -echo -hupcl 2>/dev/null || true
   # Drain whatever the port buffered from the previous image before listening.
   timeout 2 cat "$TTY" > /dev/null 2>&1 || true
   : > "$out/serial.txt"
-  timeout 300 cat "$TTY" > "$out/serial.txt" 2>/dev/null &
-  CATPID=$!
-  trap 'kill $CATPID 2>/dev/null || true' EXIT
 
   # Wait for two complete records and report the last. The firmware repeats
   # forever, so this costs a few seconds and removes every first-run effect
   # at once: a capture that started mid-record, and caches that are cold on
   # the first pass in a way they never are again.
-  deadline=$((SECONDS + 240))
+  #
+  # The reader is restarted if it stops, and appends rather than truncates. A
+  # console that is itself a USB device can disappear and come back — that is
+  # what reflashing one looks like from here — and a reader that quietly died
+  # early would otherwise present as a timeout with an empty capture and
+  # nothing to say about why.
+  deadline=$((SECONDS + 300))
+  CATPID=
+  trap 'kill $CATPID 2>/dev/null || true' EXIT
   while [ $SECONDS -lt $deadline ]; do
+    if [ -z "$CATPID" ] || ! kill -0 "$CATPID" 2>/dev/null; then
+      timeout 300 cat "$TTY" >> "$out/serial.txt" 2>/dev/null &
+      CATPID=$!
+    fi
     if [ "$(grep -ac '^END' "$out/serial.txt" 2>/dev/null || true)" -ge 2 ]; then
       break
     fi
@@ -171,4 +260,4 @@ for name in "${MODELS[@]}"; do
 done
 
 echo
-echo "on-target benchmark complete; raw captures under build/mcu/<model>/"
+echo "on-target benchmark complete; raw captures under build/mcu/$BOARD/<model>/"

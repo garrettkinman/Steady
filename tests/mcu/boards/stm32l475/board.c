@@ -148,6 +148,10 @@ void board_init(void) {
   cycles_init();
 }
 
+/* Nothing to do: the console is a UART into the debug probe's bridge chip,
+   which needs no attention between characters. */
+void board_poll(void) { }
+
 void board_putc(char c) {
   while (!(USART_ISR(USART1_BASE) & (1u << 7))) { }   /* TXE */
   USART_TDR(USART1_BASE) = (uint32_t)(uint8_t)c;
@@ -155,14 +159,22 @@ void board_putc(char c) {
 
 uint32_t board_cycles(void) { return TIM2_CNT; }
 
+const char *board_timebase(void) { return "tim2"; }
+
 uint32_t board_sysclk(void) { return SYSCLK_HZ; }
 
 /* The experiment. STM32L4 has an 8-line data cache and a 32-line instruction
    cache in front of flash, plus a prefetch buffer; weights are read through
    all three. Whether four interleaved weight streams fit in eight data-cache
    lines is not a question to settle by argument, and this is the knob that
-   settles it. ST's sequence requires a cache to be reset while disabled. */
-void board_flash_cache(int prefetch, int icache, int dcache) {
+   settles it. ST's sequence requires a cache to be reset while disabled.
+ *
+ * The sweep is the board's to define rather than the benchmark's, because
+ * what sits in front of flash is a fact about the part: this one has three
+ * independent switches, and the next one along has a different number of
+ * them under different names. The benchmark asks how many rows there are,
+ * prints the label it is handed, and stays out of it. */
+static void flash_cache(int prefetch, int icache, int dcache) {
   uint32_t acr = FLASH_ACR;
   acr &= ~((1u << 8) | (1u << 9) | (1u << 10));
   FLASH_ACR = acr;
@@ -174,4 +186,25 @@ void board_flash_cache(int prefetch, int icache, int dcache) {
   FLASH_ACR = acr;
 }
 
-uint32_t board_flash_acr(void) { return FLASH_ACR; }
+int board_cache_configs(void) { return 3; }
+
+/* Everything on, then each accelerator removed in turn. The last row is the
+   honest cacheless number, which is the one this project's target class
+   actually has. */
+const char *board_cache_label(int i) {
+  switch (i) {
+    case 0:  return "prefetch=1 icache=1 dcache=1";
+    case 1:  return "prefetch=1 icache=1 dcache=0";
+    default: return "prefetch=0 icache=0 dcache=0";
+  }
+}
+
+void board_cache_select(int i) {
+  switch (i) {
+    case 0:  flash_cache(1, 1, 1); break;
+    case 1:  flash_cache(1, 1, 0); break;
+    default: flash_cache(0, 0, 0); break;
+  }
+}
+
+uint32_t board_cache_state(void) { return FLASH_ACR; }

@@ -9,11 +9,20 @@
 
 Methodology and results behind the summary table in the [README](../README.md#performance).
 
-`nimble mcu` builds a firmware image per model, flashes a B-L475E-IOT01A — STM32L475VG, Cortex-M4 at
-80 MHz, 96 KB of usable SRAM, weights in internal flash — and reads per-operator **cycle counts**
-back over the ST-LINK's virtual COM port. No scheduler, no other process, no frequency scaling, no
-interrupt enabled anywhere in the image. Rerunning a measurement reproduces it to the cycle, and
-everything below is a before-and-after from it.
+`nimble mcu` builds a firmware image per model, flashes a board and reads per-operator **cycle
+counts** back over its console. No scheduler, no other process, no frequency scaling, no interrupt
+enabled anywhere in the image. Rerunning a measurement reproduces it to the cycle, and everything
+below is a before-and-after from it.
+
+Two boards are supported. Unless a section says otherwise, the numbers here are from the first:
+
+- **`stm32l475`** — B-L475E-IOT01A: STM32L475VG, Cortex-M4 at 80 MHz, 96 KB of usable SRAM, weights
+  in internal flash, flashed and reset through the on-board ST-LINK and read over its virtual COM
+  port. This is the reference part: every before-and-after below was measured on it, and it stays
+  the one the kernel work is judged against.
+- **`samd51`** — Adafruit ItsyBitsy M4 Express: ATSAMD51G19A, Cortex-M4 at 120 MHz, 192 KB of SRAM,
+  4 KB of unified cache. A second part rather than a faster one — see
+  [On a second part](#on-a-second-part).
 
 It exists because "the reference kernels are unoptimized" is not a measurement and neither is an
 argument about which loop to fix.
@@ -53,10 +62,10 @@ attribution least flattered by the board. `kws`, by operator kind:
 
 | | of the multiplies | of the cycles | cyc/MAC |
 |---|---|---|---|
-| `Conv2D` (5) | 89% | 77.6% | 29.80 |
-| `DepthwiseConv2D` (4) | 11% | 22.0% | 69.55 |
+| `Conv2D` (5) | 89% | 77.6% | 29.94 |
+| `DepthwiseConv2D` (4) | 11% | 22.0% | 69.74 |
 
-**A depthwise convolution costs 69.6 cycles per MAC against a convolution's 29.8**, and that is not a
+**A depthwise convolution costs 69.7 cycles per MAC against a convolution's 29.9**, and that is not a
 defect in the loop nest. A depthwise convolution does nine multiplies per output over nine values
 that are `inC` bytes apart, with no channel reduction to amortize anything over; it is a memory-bound
 operator wearing an arithmetic operator's clothes. On `person_detect` — MobileNetV1 at 0.25 width, so
@@ -75,9 +84,9 @@ The kernel work, priced on the board. `kws`, 2.66 MMAC, with the flash accelerat
 |---|---|---|---|---|
 | before | 36808 | 1169.8 ms | 35.2 cyc/MAC | |
 | blocked | 37948 | 753.8 ms | 22.7 cyc/MAC | 1.55x |
-| blocked, unrolled at compile time | 38700 | **539.2 ms** | **16.2 cyc/MAC** | **2.17x** |
+| blocked, unrolled at compile time | 38700 | **539.6 ms** | **16.3 cyc/MAC** | **2.17x** |
 
-and `vww`, MobileNetV1 at 96x96, 7.49 MMAC: **2892 ms to 1433 ms, 2.02x**.
+and `vww`, MobileNetV1 at 96x96, 7.49 MMAC: **2892 ms to 1432 ms, 2.02x**.
 
 The middle row is the whole argument for owning a board. Blocking the kernels is worth 1.55x;
 unrolling the block loop *in the Nim source instead of leaving it to the C compiler* is worth a
@@ -90,7 +99,7 @@ found it; the board is what priced it. See `unrolled` in
 Two more things the board settles:
 
 - **The flash accelerators are worth more than the kernels.** Prefetch plus the instruction and data
-  caches take `kws` from 1137 ms to 539 ms — 2.1x, larger than everything above. The benchmark sweeps
+  caches take `kws` from 1141 ms to 540 ms — 2.1x, larger than everything above. The benchmark sweeps
   them rather than assuming a configuration, and reports the cacheless row too, because that is what
   parts without them actually do. The earlier worry that four interleaved weight streams would thrash
   an 8-line data cache did not survive contact: enabling the data cache is worth 21% on `kws` *with*
@@ -104,6 +113,61 @@ linker deleted is measuring its own optimizer, so the firmware checksums its out
 refuses a record whose per-build nonce does not match the image it just flashed. Both of those exist
 because the first version of this harness reported two different kernels as identical to the digit,
 which is what a stale line in a serial buffer looks like.
+
+## On a second part
+
+`--board samd51` runs the same six models on an Adafruit ItsyBitsy M4 Express: ATSAMD51G19A, the
+same Cortex-M4 at 120 MHz, 192 KB of SRAM, a 4 KB unified cache (CMCC) and a pair of read buffers
+inside the flash controller. It was added to answer one question — how much of the table above is a
+fact about these kernels and how much is a fact about ST's memory system.
+
+Mostly the former. With each part's caching fully enabled, the two land within 2–4% of each other in
+**cycles** on every model, and in the same order:
+
+| model | STM32L475 @ 80 MHz | SAMD51 @ 120 MHz | ratio |
+|---|---|---|---|
+| `ad` | 2,413,782 | 2,375,122 | 0.98 |
+| `resnet8` | 149,371,445 | 145,826,568 | 0.98 |
+| `vww` | 114,544,319 | 111,497,163 | 0.97 |
+| `person_detect` | 112,660,040 | 110,233,310 | 0.98 |
+| `kws` | 43,169,869 | 42,421,704 | 0.98 |
+| `fomo` | 103,255,958 | 99,481,577 | 0.96 |
+
+Two things follow. The wall-clock difference between the parts is very nearly just the clock ratio,
+which is the boring and correct answer. And the per-operator attribution above — the depthwise/dense
+split in particular — reproduces: with no cache in play at all, `kws` on the SAMD51 costs 104.3
+cyc/MAC in `DepthwiseConv2d` against 41.8 in `Conv2d`, a 2.49x ratio against the STM32's 2.33x. A
+memory-bound operator is memory-bound on both.
+
+What does *not* transfer is how much the memory system is worth. The SAMD51's 4 KB cache takes `kws`
+from 1079.6 ms to 353.5 ms — **3.05x**, against 2.1x for the STM32's prefetch buffer and two caches —
+and its cacheless row is the worse of the two in cycles (48.8 cyc/MAC against 34.4), because five
+flash wait states at 120 MHz with nothing in front of them is what that costs. The cache is doing
+more work because there is more work to do. This is the reason the per-operator table is reported
+from the cacheless configuration on both boards: it is the number that is about the kernel.
+
+Every output checksum matches between the two parts.
+
+### What the port cost
+
+A `board.c`, a linker script and a `board.sh` under [../tests/mcu/boards/](../tests/mcu/boards/).
+Nothing above that directory knows which part it is talking to; the flash-accelerator sweep in
+particular is now the board's to define, because "prefetch, instruction cache, data cache" is
+STM32 vocabulary and this part has neither three switches nor those names.
+
+Two things about it are worth writing down.
+
+The board has **no debug probe and no USB-serial bridge**, so the firmware serves its own USB CDC
+console — and serves it from a polling loop, not an interrupt, because the one property this image
+cannot lose is that nothing fires inside a measured region. The cost is that the device ignores its
+host for as long as a measurement takes, which is seconds; the host notices, because setting the line
+discipline on a CDC port is a control request that blocks until the device answers it. `board_poll`
+exists for that, called between repetitions and never inside one.
+
+And an image that fails to enumerate **hands itself back to the bootloader** after about a minute.
+On a part whose only route in is USB, that is the difference between a bad build costing a reflash
+and a bad build costing someone walking over to the board to double-tap a button. The first one cost
+the latter, which is why the second exists.
 
 ## What was changed, and why it is still bit-exact
 

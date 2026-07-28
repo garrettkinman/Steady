@@ -37,8 +37,20 @@ void (*const g_vectors[])(void) = {
     Default_Handler,   /* SysTick      */
 };
 
+/* Vector Table Offset Register. Zero out of reset, which is right only when
+   the image starts at the bottom of flash. A board reached through a resident
+   bootloader does not — the SAMD51 one keeps the first 16 KB — and leaving
+   VTOR alone there points every exception at the bootloader's table, which is
+   a fault handler for a different program. Nothing here enables an interrupt,
+   so this changes only where a fault lands; that is exactly the case where
+   landing somewhere explicable is worth four bytes of code. */
+#define SCB_VTOR (*(volatile uint32_t *)0xE000ED08u)
+
 void Reset_Handler(void) {
   uint32_t *src = &_sidata;
+
+  SCB_VTOR = (uint32_t)(void *)g_vectors;
+
   uint32_t *dst = &_sdata;
   while (dst < &_edata) *dst++ = *src++;
   for (dst = &_sbss; dst < &_ebss;) *dst++ = 0;
