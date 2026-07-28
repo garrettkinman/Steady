@@ -49,6 +49,7 @@ CFLAGS="-c -Os -ffreestanding -ffunction-sections -fdata-sections -mcpu=cortex-m
 for f in *.c; do arm-none-eabi-gcc $CFLAGS -o "${f%.c}.o" "$f"; done
 arm-none-eabi-gcc $CFLAGS -o weights.o "$ROOT/tests/generated/tiny_cnn_weights.c"
 arm-none-eabi-gcc $CFLAGS -o weights_branch.o "$ROOT/tests/generated/branch_net_weights.c"
+arm-none-eabi-gcc $CFLAGS -o weights_posit.o "$ROOT/tests/generated/posit_net_weights.c"
 
 cat > root.c <<'EOF'
 /* Roots for --gc-sections: without these the linker would discard the
@@ -62,17 +63,23 @@ extern void steady_branch_invoke(void);
 extern signed char *steady_branch_input(void);
 extern signed char *steady_branch_output(void);
 extern int steady_branch_arena_size(void);
+extern void steady_posit_invoke(void);
+extern unsigned char *steady_posit_input(void);
+extern unsigned char *steady_posit_output(void);
+extern int steady_posit_arena_size(void);
 void _start(void) {
   steady_selftest(); steady_model_invoke();
   steady_model_input(); steady_model_output(); steady_arena_size();
   steady_branch_invoke();
   steady_branch_input(); steady_branch_output(); steady_branch_arena_size();
+  steady_posit_invoke();
+  steady_posit_input(); steady_posit_output(); steady_posit_arena_size();
   for (;;) { }
 }
 EOF
 arm-none-eabi-gcc $CFLAGS -o root.o root.c
 
-arm-none-eabi-gcc -o image.elf root.o ./@m*.o ./@p*.o weights.o weights_branch.o \
+arm-none-eabi-gcc -o image.elf root.o ./@m*.o ./@p*.o weights.o weights_branch.o weights_posit.o \
   -mcpu=cortex-m4 -mthumb -nostartfiles -Wl,--gc-sections -Wl,-e,_start \
   -Wl,-Ttext=0x08000000 -Wl,-Tbss=0x20000000 \
   --specs=nosys.specs --specs=nano.specs -Wl,-Map=image.map
@@ -113,6 +120,20 @@ if ! grep -qE "^0800.* R steady_.*_exp" symbols.txt; then
   exit 1
 fi
 echo "    activation and exp tables in flash (.rodata)"
+# The posit decode table is the runtime's own constant rather than a
+# generated one — the only such table there is — so it is audited by name.
+if ! grep -qE "^0800.* [Rr] UnitsTable" symbols.txt; then
+  echo "FAIL: the posit decode table is not in .rodata"
+  exit 1
+fi
+echo "    posit decode table in flash (.rodata)"
+# A fixed-point quire exists so that a part with no FPU never needs a soft
+# float library. If one got linked, the policy is not doing its job.
+if grep -iqE " (T|t|W) __aeabi_(f|d)(add|sub|mul|div|cmp)" symbols.txt; then
+  echo "FAIL: a software floating-point routine is reachable from the image"
+  exit 1
+fi
+echo "    no soft-float routines linked in"
 if ! grep -qE "^2000.* B arena" symbols.txt; then
   echo "FAIL: arena is not in .bss"
   exit 1

@@ -29,18 +29,59 @@ Plus one member only 8-bit policies have: `lutIndex(P, v: Store) -> int`, the ra
 value. Its presence *is* the statement "this storage type has 256 values and the host can tabulate a
 function over it" — see [Non-linear activations](#non-linear-activations).
 
-Three policies ship: `AffineI8`, `RealF32`, `RealFp8`.
+Four policies ship: `AffineI8`, `RealF32`, `RealFp8`, `RealP8`.
 
-**`mac` is a primitive, not sugar for `acc += a * b`.** A posit policy accumulates into a *quire* —
-an exact fixed-point accumulator that supports fused multiply-accumulate and nothing else. There is
-no `*` on a quire. Routing every kernel through `mac` is what keeps that door open, and it is the
-single most expensive thing to retrofit.
+**`mac` is a primitive, not sugar for `acc += a * b`.** `RealP8` accumulates into a *quire* — an
+exact fixed-point accumulator that supports fused multiply-accumulate and nothing else. There is no
+`*` on a quire. Routing every kernel through `mac` is what kept that door open, and it is the single
+most expensive thing to retrofit; `RealP8` was added without touching a line of kernel source.
 
-`RealFp8` (OCP FP8 E4M3) exists as the **canary**. It is a non-native storage type with software
-arithmetic, a widening conversion into a different accumulator, and no scale metadata — every code
-path a posit policy will need. All eight kernels compile and run correctly under all three policies
-with no `when` branches in kernel source. Two policies would not have proven that; the third forced
-it.
+`RealFp8` (OCP FP8 E4M3) existed first as the **canary**. It is a non-native storage type with
+software arithmetic, a widening conversion into a different accumulator, and no scale metadata —
+every code path a posit policy needs. All eight kernels compile and run correctly under all four
+policies with no `when` branches in kernel source. Two policies would not have proven that; the
+third forced it, and the fourth collected on it.
+
+### The quire
+
+`RealP8` is posit(8,0), and the choice of `es = 0` is what makes its accumulator exact rather than
+merely wide.
+
+A posit's fraction field loses one bit for each bit its regime gains, so the spacing of the densest
+binade and the spacing of the sparsest coincide at the bottom. For posit(8,0) that spacing is 2^-6
+and the largest magnitude is 2^6, which means **every representable value is an integer multiple of
+2^-6** — the whole format fits an int16 with room over. A product of two of them is therefore an
+integer multiple of 2^-12, and so is any sum of products.
+
+So the quire is an `int64` counting units of 2^-12:
+
+| | |
+|---|---|
+| `mac` | two table loads and one 16x16 multiply into an int64 — exact |
+| `addBias`, `accumulate` | a shift by 6 — exact |
+| headroom | a product is at most 2^24 units, so 2^38 taps fit before overflow |
+| `finish` | clamps in the quire domain, then rounds **once** |
+
+A convolution's entire reduction is the real-valued reduction. `RealFp8` approximates that with a
+float32 accumulator, which rounds at every step and merely rounds finely. The difference is not
+academic on the target hardware either: the quire is integer arithmetic throughout, so a posit model
+links no soft-float routines on a part with no FPU, and `nimble freestanding` fails the build if one
+appears.
+
+The one inexact step is division, because a quire is fixed point and a mean has to land back on the
+2^-12 grid before it can become a posit. That is a double rounding, bounded at half of 1/64 of a
+posit ulp, and it is the only place the policy rounds twice. A 2x2 average pool does not even hit it:
+a sum of posits is always a multiple of 2^-6, so dividing by four is exact.
+
+Rounding follows the posit standard rather than IEEE habits — ties to even *in the encoding*, which
+is not the same rule as ties to even in the fraction once the fraction field runs out; saturation at
+maxpos, since there is no infinity; and a nonzero magnitude below minpos rounds to minpos rather than
+to zero, since a posit has no subnormals and flushing would turn a small weight into an absent one.
+
+Two encoders exist and are derived independently: `toPosit8` walks a float on the host and encodes
+every weight, `positFromQuire` scans an integer on the target and rounds every activation. They are
+checked against each other over the whole quire range, which is also what makes the end-to-end test
+meaningful — see [Verification](#verification).
 
 ### Adding a numeric format
 
@@ -48,9 +89,13 @@ The host and the target need *different* things from a numeric type, which is wh
 not require a posit implementation up front:
 
 - **Host** needs `decode: bits -> float64` and `encode: float64 -> bits` — for converting weights,
-  generating activation lookup tables, and running the reference harness. A SoftPosit binding plugs
-  in here, on a real OS. This is `steadyc/codec.nim`, and it is the entire host-side numeric surface.
+  generating activation lookup tables, and running the reference harness. This is
+  `steadyc/codec.nim`, and it is the entire host-side numeric surface.
 - **Target** needs `mac`, `finish`, `zero`, plus `lutIndex` if the format is 8-bit. Nothing else.
+
+`RealP8` is the worked example. Adding it was one new module (`steady/posit8.nim`), one policy
+block, and a case arm in each of six `case` statements the compiler pointed at by refusing to
+compile without them. No kernel changed, no planner change, no emitter restructuring.
 
 ## Non-linear activations
 
@@ -75,8 +120,8 @@ so the normalising divide can never see a zero denominator. Ten classes get a ta
 than a worst-case bound would allow, decided at compile time and costing nothing.
 
 This is where a format's structure decides an op's availability rather than the code branching on it:
-`RealF32` has no enumerable domain, so it has no table activations; `RealFp8` has one but is not
-uniform, so it has tables and no softmax. Both are host-side validation errors naming the op and the
+`RealF32` has no enumerable domain, so it has no table activations; `RealFp8` and `RealP8` each have
+one but are not uniform, so they have tables and no softmax. Both are host-side validation errors naming the op and the
 policy — the kernel set stays policy-generic, and the *op* set is a property of the number format.
 
 The tables are within one LSB of a float64 reference over the whole input domain
@@ -133,21 +178,42 @@ Requantization arithmetic is shared between runtime and simulator, so that is co
 vectors pinned to the published gemmlowp definitions. Activation tables and the softmax normalisation
 are shared the same way, and are pinned the same way — against a float64 reference, entry by entry.
 
+A third model is checked the same way under `RealP8`, where the deliberate difference is the
+*accumulator* rather than the folding. The runtime reduces into an int64 quire — fixed point,
+integers, no floating point on the target at all. `simulatePosit` reduces the same taps in float64,
+which is an exact medium for this format since every product is an integer count of 2^-12, and
+rounds with `toPosit8` rather than the runtime's `positFromQuire`. Bit-identical output therefore
+proves two things at once: that the quire is exact, and that the two encoders are the same function.
+The model's inputs sweep all 256 encodings including NaR, which the policy documents as decoding to
+zero in arithmetic and passing through a lookup table intact.
+
+The posit format itself is checked exhaustively rather than by sampling — 256 encodings is few
+enough that there is no reason to check a subset and wonder about the rest. Every encoding
+round-trips through both encoders; ordering is verified monotonic under a signed compare; `mac` is
+checked exact for all 65536 pairs; and the two encoders are compared against each other at every
+point of the quire range that can produce a distinct posit.
+
 ### The bare-metal audit
 
-`nimble freestanding` links a real Cortex-M4 image containing both models and audits it:
+`nimble freestanding` links a real Cortex-M4 image containing all three models and audits it:
 
 ```
 ==> Image size
    text    data     bss     dec
-   7284       4     904    8192
+  16552       4    1480   18036
 ==> Allocator audit
     no allocator linked in
 ==> Placement audit
     weights in flash (.rodata)
     activation and exp tables in flash (.rodata)
+    posit decode table in flash (.rodata)
+    no soft-float routines linked in
     arena in RAM (.bss)
 ```
+
+The soft-float check is the posit policy's own claim under audit. A fixed-point quire exists so that
+a part with no FPU never needs one; if `__aeabi_dadd` and friends ever became reachable, the policy
+would still produce correct answers and would have quietly stopped being the thing it is for.
 
 That last check matters more than it looks. Nim `const` cannot have its address taken and a
 module-level `let` lands in `.data` — copied into RAM at startup, which on a part with 64 KB of SRAM
@@ -226,11 +292,70 @@ different claims and only the second one is interesting.
 
 ## Hardware acceleration
 
+There are two target-side seams, at different heights, because different hardware attaches at
+different heights. Both resolve with `when compiles(...)`, so both are free at runtime, and a backend
+may use either or both.
+
+### Whole kernels — `steady_backend`
+
 Write a module named `steady_backend` exposing any subset of the kernel entry points, then build with
 `-d:steadyBackend --path:<dir>`. Overriding is per-op *and* per-policy — a backend defining only an
 int8 `conv2d` gets used for int8 convolutions and ignored everywhere else, because the
 `when compiles(...)` test fails for other instantiations and falls through. Nothing is forked and no
 stubs are required. See [tests/fixtures/steady_backend.nim](../tests/fixtures/steady_backend.nim).
+
+This is the seam for an NPU or a CMSIS-NN port: hardware that swallows a whole layer.
+
+### Arithmetic — `steady_arith`
+
+A posit arithmetic unit does not accelerate `conv2d`; it accelerates `mac`. Routing that through the
+op-level seam would mean reimplementing seven kernels that differ from the reference only in which
+instruction sits in the innermost loop, which is exactly the forking this design exists to avoid.
+
+So the policy members dispatch too. Write a module named `steady_arith` defining any subset of
+`mac`, `addBias`, `finish`, `zeroAccum`, `accumulate`, `divAccum`, `meanScale`, `storeOf`,
+`addRescaled`, `lowestStore`, `lutIndex` — per policy — and build with `-d:steadyArith --path:<dir>`.
+Overriding `mac` for one policy makes convolution, depthwise, fully-connected, add, concat-rescale,
+mean and pooling all faster at once, with no kernel touched.
+
+The block widths dispatch through the same seam. `OcBlock`, `DwBlock` and `FcBlock` decide how many
+accumulators are in flight, which is a fact about the register file holding them: four is right for a
+core carrying int32 or float32 accumulators, and a posit unit with a *single* quire register wants
+one, since blocking by four would spill the quire to memory every iteration and lose more than the
+load reuse gains.
+
+An arithmetic backend imports `steady/contract` rather than `steady/policy`, and that is what keeps
+the layering acyclic — it has to name `RealP8` to overload on it, and the module it overrides cannot
+import the module overriding it:
+
+```
+contract.nim        tags, associated types, params, block widths
+  steady_arith      (optional) hardware arithmetic — below the policy
+policy.nim          default members
+kernels/arith.nim   per-member dispatch
+kernels/reference   sequenced loops
+  steady_backend    (optional) whole-kernel override — above them
+```
+
+The defaults stay compiled and reachable whatever a backend does, which is what makes a backend
+differential-testable rather than merely a substitute for the thing it replaces.
+[tests/fixtures/steady_arith.nim](../tests/fixtures/steady_arith.nim) is the worked example: it
+replaces `mac` for `RealP8` with arithmetic identical to the default and sets every block width to 1,
+so the kernels take their unblocked path. `nimble test` then runs the whole suite — including the
+end-to-end posit model against a reference that knows nothing about either — and requires every
+result to come out bit-identical. What is under test is that the seam changes nothing.
+
+**Not overridable**: the associated types. A backend may replace the arithmetic over an accumulator;
+changing what the accumulator *is* — a hardware quire register rather than an int64 — changes what
+the host emits too, so that is a new policy rather than an override. Same rule as fp8: E5M2 hardware
+does not accelerate `RealFp8`, it is a different format with its own codec and its own policy.
+
+**Not yet done**: SIMD. A vector unit needs the loop to be vector-shaped, not just the primitive to
+be faster, and the intended shape is a `Lanes(P)` associated constant plus a widened `mac` over lane
+vectors, with today's scalar policies as the degenerate `Lanes = 1` case so the kernels stay one
+source. That is a change to the kernels rather than to this seam. Blocked activation layouts are the
+other half of it and would reach further — the host layout hook rewrites constants only, so a vector
+unit wanting NC8HW8 activations would need shape inference and the arena planner to agree.
 
 A faster kernel is usually not the whole story: CMSIS-NN wants particular weight orderings, an NPU
 wants weights pre-tiled, and both want it arranged at build time. That half is the host-side hook in

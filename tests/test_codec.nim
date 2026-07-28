@@ -54,6 +54,21 @@ suite "storage codecs":
       check decodeStore(pkRealFp8, Quant(), raw) == float64(f)
       check encodeStore(pkRealFp8, Quant(), float64(f)) == raw
 
+  test "posit decode and encode agree with the runtime's own conversions":
+    for raw in 0 ..< LutSize:
+      let p = Posit8(uint8(raw))
+      if p.isNaR:
+        # NaR has no real value; it decodes to NaN and encodes back from one.
+        check decodeStore(pkRealP8, Quant(), raw) != decodeStore(pkRealP8, Quant(), raw)
+        check encodeStore(pkRealP8, Quant(), NaN) == raw
+      else:
+        check decodeStore(pkRealP8, Quant(), raw) == p.toFloat64
+        check encodeStore(pkRealP8, Quant(), p.toFloat64) == raw
+
+  test "a posit encode saturates rather than wrapping":
+    check encodeStore(pkRealP8, Quant(), 1.0e9) == int(Posit8Max.bits)
+    check encodeStore(pkRealP8, Quant(), -1.0e9) == int(Posit8Min.bits)
+
   test "RealF32 has no byte domain, and says so":
     expect CodecError:
       discard decodeStore(pkRealF32, Quant(), 0)
@@ -86,6 +101,16 @@ suite "activation tables":
     let table = buildLut(pkRealFp8, Quant(), Quant(), activationFn(okTanh))
     check Fp8(table[int(Fp8Nan.bits)]).isNan
     check Fp8(table[int(toFp8(0.5'f32).bits)]).toFloat32 == toFp8(tanh(0.5'f32)).toFloat32
+
+  test "a posit table propagates NaR instead of inventing a value":
+    let table = buildLut(pkRealP8, Quant(), Quant(), activationFn(okTanh))
+    check Posit8(table[int(Posit8NaR.bits)]).isNaR
+    check Posit8(table[int(toPosit8(0.5).bits)]).toFloat64 == toPosit8(tanh(0.5)).toFloat64
+    # The table is the function, rounded once: every entry, not a sample.
+    for raw in 0 ..< LutSize:
+      let p = Posit8(uint8(raw))
+      if p.isNaR: continue
+      check Posit8(table[raw]).bits == toPosit8(tanh(p.toFloat64)).bits
 
   test "RealF32 cannot have a table built for it":
     expect CodecError:
@@ -206,6 +231,8 @@ suite "ops the host must reject":
     for kind in [okLogistic, okTanh]:
       var ok8 = oneOpGraph(pkRealFp8, kind)
       ok8.validate                                  # fp8 is fine
+      var okP = oneOpGraph(pkRealP8, kind)
+      okP.validate                                  # and so is posit8
       var bad = oneOpGraph(pkRealF32, kind)
       expect IrError:
         bad.validate
@@ -213,7 +240,7 @@ suite "ops the host must reject":
   test "softmax needs a uniform integer domain, so affine only":
     var good = oneOpGraph(pkAffineI8, okSoftmax)
     good.validate
-    for policy in [pkRealF32, pkRealFp8]:
+    for policy in [pkRealF32, pkRealFp8, pkRealP8]:
       var bad = oneOpGraph(policy, okSoftmax)
       expect IrError:
         bad.validate

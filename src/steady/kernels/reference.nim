@@ -26,9 +26,9 @@
 ## cacheless part is often faster than the bounds test it replaces.
 
 import std/macros
-import ../policy
+import ./arith
 
-export policy
+export arith
 
 macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
   ## `for idx in 0 ..< n`, expanded here rather than left to the C compiler:
@@ -93,26 +93,16 @@ macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
 # registers. A runtime block count would put it back in memory and cost more
 # than the reuse gains.
 
-const
-  OcBlock = 4
-    ## Output channels per convolution block.
-  DwBlock = 4
-    ## Channels per depthwise block.
-  FcBlock = 4
-    ## Rows of a fully-connected weight matrix per block, sharing one pass over
-    ## the input vector.
-    ##
-    ## All three are four because four measured fastest, not because four is a
-    ## natural number: two was about 10% worse and eight was worse than two.
-    ## Eight is worth understanding, because it is the width a vector unit
-    ## would want — with eight accumulators plus eight weights and eight
-    ## activations live at once, the compiler spilled seven of the eight
-    ## accumulators to the stack, and the reuse did not pay for the traffic.
-    ## So the right width is a property of the target's register file, and
-    ## these are the first constants to re-tune for a different one. They are
-    ## three constants rather than one because the kernels want them for
-    ## different reasons, and a machine with SIMD will not want the same number
-    ## in all three places.
+# Block widths are `ocBlockOf(P)`, `dwBlockOf(P)` and `fcBlockOf(P)`, resolved
+# per policy in `contract.nim` and overridable by an arithmetic backend. They
+# are not constants of this file because what they trade against is the
+# target's register file and how many accumulators of `Accum(P)` fit in it —
+# four is right for a core holding int32 or float32, and a posit unit with a
+# single quire register wants one. See the note in `contract.nim` for the
+# measurements behind the default.
+#
+# They are bound to a `const` at the top of each kernel so that the value is a
+# compile-time literal by the time `unrolled` sees it.
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # FULLY CONNECTED
@@ -129,10 +119,11 @@ proc fullyConnected*[P, S, B, PT](
   ## y[outDim] = finish(W[outDim, inDim] * x[inDim] + bias)
   ## Weights are row-major over [outDim, inDim].
   ##
-  ## Rows are computed `FcBlock` at a time. The input vector is read once for
+  ## Rows are computed `fcBlockOf(P)` at a time. The input vector is read once for
   ## the whole block instead of once per row, which is the entire trick: a
   ## fully-connected layer reads its weights exactly once no matter what, so
   ## activation loads are the only thing left to save.
+  const Fc = fcBlockOf(P)
   static:
     assert S is Store(P), "fullyConnected: storage type mismatch"
     assert B is Bias(P), "fullyConnected: bias type mismatch"
@@ -150,9 +141,9 @@ proc fullyConnected*[P, S, B, PT](
       y[o + k] = finish(P, acc[k], prm, o + k)
 
   var o = 0
-  while o + FcBlock <= outDim:
-    rows(FcBlock, o)
-    o += FcBlock
+  while o + Fc <= outDim:
+    rows(Fc, o)
+    o += Fc
   while o < outDim:
     rows(1, o)
     inc o
@@ -175,7 +166,7 @@ proc conv2d*[P, S, B, PT](
     padTop, padLeft: int,
     dilationH, dilationW: int,
     padValue: S) =
-  ## Output channels are computed `OcBlock` at a time, so one pass over an
+  ## Output channels are computed `ocBlockOf(P)` at a time, so one pass over an
   ## input patch feeds four filters rather than being repeated for each.
   ##
   ## A stride-1-or-more 1x1 convolution with no padding gets its own path.
@@ -191,6 +182,7 @@ proc conv2d*[P, S, B, PT](
   ## no padding the host's own shape rule gives `(outH - 1) * strideH <= inH - 1`,
   ## so every sampled position is inside by construction. Shapes are validated
   ## on the host precisely so kernels can rely on them.
+  const Oc = ocBlockOf(P)
   static:
     assert S is Store(P), "conv2d: storage type mismatch"
     assert B is Bias(P), "conv2d: bias type mismatch"
@@ -241,16 +233,16 @@ proc conv2d*[P, S, B, PT](
       let yBase = (oy * outW + ox) * outC
       var oc = 0
       if pointwise:
-        while oc + OcBlock <= outC:
-          filters(OcBlock, oc, true)
-          oc += OcBlock
+        while oc + Oc <= outC:
+          filters(Oc, oc, true)
+          oc += Oc
         while oc < outC:
           filters(1, oc, true)
           inc oc
       else:
-        while oc + OcBlock <= outC:
-          filters(OcBlock, oc, false)
-          oc += OcBlock
+        while oc + Oc <= outC:
+          filters(Oc, oc, false)
+          oc += Oc
         while oc < outC:
           filters(1, oc, false)
           inc oc
@@ -285,9 +277,9 @@ proc depthwiseConv2d*[P, S, B, PT](
   ## each, and does it again for the next channel.
   ##
   ## Blocking the channel axis turns that inside out. For a block of
-  ## `DwBlock` channels the nine activation loads become nine *contiguous*
+  ## `dwBlockOf(P)` channels the nine activation loads become nine *contiguous*
   ## runs, and the nine weight loads likewise, because the filter's channel
-  ## axis is its innermost one. Same multiplies, a `DwBlock`-th of the touched
+  ## axis is its innermost one. Same multiplies, a block's-worth fewer of the touched
   ## lines, and the inner loop is a shape a vector unit could take over
   ## unchanged.
   ##
@@ -296,6 +288,7 @@ proc depthwiseConv2d*[P, S, B, PT](
   ## emit. A larger multiplier falls back to one channel at a time, where
   ## `oc div depthMultiplier` is the right input channel and the arithmetic
   ## costs nothing because it happens once per block rather than once per tap.
+  const Dw = dwBlockOf(P)
   static:
     assert S is Store(P), "depthwiseConv2d: storage type mismatch"
     assert B is Bias(P), "depthwiseConv2d: bias type mismatch"
@@ -337,9 +330,9 @@ proc depthwiseConv2d*[P, S, B, PT](
       let yBase = (oy * outW + ox) * outC
       var oc = 0
       if blocked:
-        while oc + DwBlock <= outC:
-          channels(DwBlock, oc)
-          oc += DwBlock
+        while oc + Dw <= outC:
+          channels(Dw, oc)
+          oc += Dw
       while oc < outC:
         channels(1, oc)
         inc oc

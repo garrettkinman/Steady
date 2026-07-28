@@ -20,5 +20,6 @@ tests/test_*
 !tests/test_*.nim
 examples/tiny_cnn
 examples/branch_net
+examples/posit_net
 !examples/*.nim
 *.exe

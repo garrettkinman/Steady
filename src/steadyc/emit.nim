@@ -22,8 +22,9 @@
 ## `invoke` contains no dispatch, no op table, and no interpreter — just the
 ## calls, in order, with every buffer address resolved to a constant offset.
 
-import std/[strformat, strutils, tables, times, os]
+import std/[strformat, strutils, tables, times, os, math]
 import ./ir, ./quant, ./arena, ./codec, ./backend
+import ../steady/posit8
 
 const ToolVersion* = "0.1.0"
 
@@ -105,7 +106,7 @@ proc emitArrayBody(s: var string, dtype: DType, count: int, data: seq[byte]) =
     for i in 0 ..< count:
       if i mod PerLine == 0: s.add "\n  "
       s.add $cast[int8](data[i]) & ","
-  of dtFp8:
+  of dtFp8, dtPosit8:
     for i in 0 ..< count:
       if i mod PerLine == 0: s.add "\n  "
       s.add "0x" & toHex(data[i], 2) & "u,"
@@ -197,10 +198,29 @@ proc paramsExpr(g: Graph, rp: ResolvedParams, multSym, shiftSym: string,
     &"shift: cast[ptr UncheckedArray[int32]](addr {shiftSym}), " &
     &"channelStride: {stride}, outZeroPoint: {rp.outZeroPoint}'i32, " &
     &"actMin: {rp.qActMin}'i32, actMax: {rp.qActMax}'i32)"
+  elif g.policy == pkRealP8:
+    # Quire domain: fixed point in units of 2^-QuireScale, so an activation
+    # bound becomes an integer and the clamp happens before the single
+    # rounding rather than after it. Every bound this can produce — 0, 1, 6 —
+    # is exact on that grid. A fixed-point accumulator has no infinity, so an
+    # absent bound is the end of the type.
+    let lo = if rp.fActMin == NegInf.float32: "low(Quire)"
+             else: &"{int64(round(float64(rp.fActMin) * float64(QuireOne)))}'i64"
+    let hi = if rp.fActMax == Inf.float32: "high(Quire)"
+             else: &"{int64(round(float64(rp.fActMax) * float64(QuireOne)))}'i64"
+    &"RealParams[Quire](actMin: {lo}, actMax: {hi})"
   else:
     let lo = if rp.fActMin == NegInf.float32: "-Inf.float32" else: &"{rp.fActMin}'f32"
     let hi = if rp.fActMax == Inf.float32: "Inf.float32" else: &"{rp.fActMax}'f32"
     &"RealParams[float32](actMin: {lo}, actMax: {hi})"
+
+proc positLiteral(v: float64): string =
+  ## A posit as its encoding, resolved here rather than on the device.
+  ##
+  ## The fp8 arms below spell a conversion the target then performs at
+  ## runtime, once per invoke per constant. There is no reason to: the host
+  ## already owns the codec, and a byte is a byte.
+  &"Posit8(0x{toHex(byte(encodeStore(pkRealP8, Quant(), v)), 2)}'u8)"
 
 proc storeLiteral(p: PolicyKind, v: int32): string =
   ## A Store-typed literal for clamp bounds and pad values.
@@ -208,6 +228,7 @@ proc storeLiteral(p: PolicyKind, v: int32): string =
   of pkAffineI8: &"{v}'i8"
   of pkRealF32: &"{float32(v)}'f32"
   of pkRealFp8: &"toFp8({float32(v)}'f32)"
+  of pkRealP8: positLiteral(float64(v))
 
 proc storeLiteralF(p: PolicyKind, q: Quant, v: float64): string =
   ## A Store-typed literal for a *real* value the graph specified — the pad
@@ -218,6 +239,7 @@ proc storeLiteralF(p: PolicyKind, q: Quant, v: float64): string =
   of pkAffineI8: &"{quantizedValue(p, q, v)}'i8"
   of pkRealF32: &"{float32(v)}'f32"
   of pkRealFp8: &"toFp8({float32(v)}'f32)"
+  of pkRealP8: positLiteral(v)
 
 proc biasLiteral(p: PolicyKind, v: int32): string =
   ## A Bias-typed literal, in accumulator units. Only ever non-zero for
@@ -226,6 +248,7 @@ proc biasLiteral(p: PolicyKind, v: int32): string =
   of pkAffineI8: &"{v}'i32"
   of pkRealF32: &"{float32(v)}'f32"
   of pkRealFp8: &"toFp8({float32(v)}'f32)"
+  of pkRealP8: positLiteral(float64(v))
 
 proc clampLiteral(p: PolicyKind, fused: FusedAct, outQ: Quant): (string, string) =
   case p
@@ -240,6 +263,10 @@ proc clampLiteral(p: PolicyKind, fused: FusedAct, outQ: Quant): (string, string)
     let (lo, hi) = realActRange(fused)
     ((if lo == NegInf.float32: "Fp8Min" else: &"toFp8({lo}'f32)"),
      (if hi == Inf.float32: "Fp8Max" else: &"toFp8({hi}'f32)"))
+  of pkRealP8:
+    let (lo, hi) = realActRange(fused)
+    ((if lo == NegInf.float32: "Posit8Min" else: positLiteral(float64(lo))),
+     (if hi == Inf.float32: "Posit8Max" else: positLiteral(float64(hi))))
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # MAIN EMITTER
@@ -307,7 +334,7 @@ const
 
   # Code is accumulated one op at a time rather than into a single string, so
   # that the same text can be assembled twice: into `invoke`, and — only under
-  # `-d:steadyProfile` — into a per-op entry point the benchmark harness calls
+  # `-d:steadyProfile` — into a per-op entry point the on-target harness calls
   # individually. Attribution is otherwise guesswork, and a profiler that
   # cannot name the operator cannot tell "this layer does more work" from
   # "this kernel is worse".
@@ -662,7 +689,7 @@ template A(off: int, T: typedesc): ptr UncheckedArray[T] =
   if g.ops.len > 0:
     nimSrc.add &"""
 when defined(steadyProfile):
-  ## Per-operator entry points, for the host benchmark harness. One `case`
+  ## Per-operator entry points, for the on-target benchmark harness. One `case`
   ## over a compile-time constant, so each branch is still the same
   ## straight-line code `invoke` contains — no dispatch reaches a kernel.
   ##

@@ -6,7 +6,7 @@
 ## The profiling emission.
 ##
 ## `-d:steadyProfile` makes the emitter assemble the same operator calls a
-## second time, as per-op entry points the benchmark harness can time
+## second time, as per-op entry points the on-target benchmark harness can time
 ## individually. Everything the benchmark reports rests on those two
 ## assemblies being the same program, so that is what this checks: driving the
 ## ops one at a time, in order, must produce bit-identical output to `invoke`.

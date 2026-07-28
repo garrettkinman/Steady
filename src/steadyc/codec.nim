@@ -29,7 +29,7 @@
 
 import std/[math, strformat]
 import ./ir
-import ../steady/fp8
+import ../steady/[fp8, posit8]
 
 type CodecError* = object of CatchableError
 
@@ -53,6 +53,8 @@ proc decodeStore*(p: PolicyKind, q: Quant, raw: int): float64 =
     q.scales[0] * float64(v - zero)
   of pkRealFp8:
     float64(Fp8(uint8(raw)).toFloat32)
+  of pkRealP8:
+    Posit8(uint8(raw)).toFloat64
   of pkRealF32:
     raise newException(CodecError,
       "RealF32 has no enumerable storage domain; there is nothing to decode " &
@@ -75,6 +77,11 @@ proc encodeStore*(p: PolicyKind, q: Quant, v: float64): int =
   of pkRealFp8:
     if v != v: return int(Fp8Nan.bits)
     int(toFp8(float32(v)).bits)
+  of pkRealP8:
+    # NaN maps to NaR, which is how a table activation keeps an
+    # unrepresentable input unrepresentable instead of inventing a value.
+    if v != v: return int(Posit8NaR.bits)
+    int(toPosit8(v).bits)
   of pkRealF32:
     raise newException(CodecError,
       "RealF32 values are emitted as literals; there is no byte encoding step")

@@ -3,147 +3,28 @@
 # This software is released under the MIT License.
 # https://opensource.org/licenses/MIT
 
-## Numeric policies.
+## Default implementations of the numeric policy contract.
 ##
-## A policy is an empty tag type plus a set of overloaded templates. It
-## abstracts over *what happens between accumulate and store*, which is the
-## only place integer-affine quantization and real-number formats genuinely
-## differ once the host compiler has done its job.
+## The contract itself — the policy tags, the associated types, the params,
+## the block widths — lives in `contract.nim`. This module supplies the
+## members: what `mac` does, what `finish` does, and so on, for each of the
+## four policies that ship.
 ##
-## The contract, for a policy `P`:
+## The split exists so that an arithmetic backend can override those members.
+## A backend has to name `RealP8` to overload on it, and the module it is
+## overriding cannot import the module overriding it, so the tags sit one
+## level below in `contract.nim` and both import that. Kernels do not call
+## into here directly; they go through `kernels/arith.nim`, which selects
+## between a backend's member and the default below at compile time. See that
+## module for how to supply one.
 ##
-##   Store(P)      typedesc   stored element type
-##   Accum(P)      typedesc   accumulator type
-##   Bias(P)       typedesc   bias element type (differs from Store for affine!)
-##   Params(P)     typedesc   per-op finish metadata
-##
-##   zeroAccum(P)                   -> Accum(P)
-##   mac(P, acc: var Accum, a, b: Store)
-##   addBias(P, acc: var Accum, b: Bias)
-##   finish(P, acc: Accum, prm: Params, ch: int) -> Store
-##
-## `mac` is a *primitive*, not sugar for `acc += a * b`. A posit policy
-## accumulates into a quire, which supports fused multiply-accumulate and
-## nothing else — there is no `*` on a quire. Writing kernels in terms of
-## `mac` is what keeps that door open, and it is the single most expensive
-## thing to retrofit later.
-##
-## Two further contract requirements, both relied on by kernels:
-##
-##   * `<` on `Store(P)` must agree with the ordering of the real values it
-##     encodes. True for int8 under a positive affine scale, for fp8 via an
-##     explicit fold, and free for posits (monotonic under two's-complement).
-##   * `Bias(P)` values are in *accumulator* units. For affine that means the
-##     host has already folded zero-point correction and bias rescaling into
-##     an int32 constant; the kernel never sees a zero point.
-##
-## Templates are used rather than concepts deliberately: they inline
-## unconditionally (so the abstraction is genuinely free), and a missing
-## member produces "undeclared identifier: mac" rather than a concept-match
-## essay.
+## Every default here stays compiled and reachable whatever a backend does,
+## which is what makes a backend differential-testable rather than merely a
+## substitute.
 
-import ./fp8
+import ./contract
 
-export fp8
-
-type
-  AffineI8* = object
-    ## TFLite-style affine quantization: real = scale * (q - zeroPoint).
-    ## int8 storage, int32 accumulation, Q31 multiplier + shift on the way out.
-
-  RealF32* = object
-    ## Plain float32. Trivial, but it exercises the empty-metadata path.
-
-  RealFp8* = object
-    ## OCP FP8 E4M3 storage, float32 accumulation. The stand-in for posits.
-
-  AffineParams* = object
-    ## Per-op requantization metadata. `mult` and `shift` point at const
-    ## (flash-resident) arrays emitted by the host compiler.
-    ##
-    ## `channelStride` is 0 for per-tensor quantization and 1 for
-    ## per-channel, so the same indexing expression serves both without a
-    ## branch and without duplicating a per-tensor scale N times in flash.
-    mult*: ptr UncheckedArray[int32]
-    shift*: ptr UncheckedArray[int32]
-    channelStride*: int
-    outZeroPoint*: int32
-    actMin*, actMax*: int32     ## fused activation clamp, quantized domain
-
-  RealParams*[A] = object
-    ## Accumulator-domain clamp for fused activations.
-    ##
-    ## Note this is deliberately *not* an empty type. Real formats need no
-    ## scale metadata, but they are not metadata-free in general: a posit
-    ## policy will likely want a per-tensor power-of-two rescale here to
-    ## centre a tensor's distribution on the high-accuracy band around 1.0.
-    actMin*, actMax*: A
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# ASSOCIATED TYPES
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-template Store*(_: typedesc[AffineI8]): typedesc = int8
-template Accum*(_: typedesc[AffineI8]): typedesc = int32
-template Bias*(_: typedesc[AffineI8]): typedesc = int32
-template Params*(_: typedesc[AffineI8]): typedesc = AffineParams
-
-template Store*(_: typedesc[RealF32]): typedesc = float32
-template Accum*(_: typedesc[RealF32]): typedesc = float32
-template Bias*(_: typedesc[RealF32]): typedesc = float32
-template Params*(_: typedesc[RealF32]): typedesc = RealParams[float32]
-
-template Store*(_: typedesc[RealFp8]): typedesc = Fp8
-template Accum*(_: typedesc[RealFp8]): typedesc = float32
-template Bias*(_: typedesc[RealFp8]): typedesc = Fp8
-template Params*(_: typedesc[RealFp8]): typedesc = RealParams[float32]
-
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# GEMMLOWP FIXED-POINT REQUANTIZATION
-# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# These must match TFLite bit-for-bit. Deviating by one LSB here is wrong
-# across an entire network and is invisible without a reference harness.
-
-func satRoundDoublingHighMul*(a, b: int32): int32 {.inline.} =
-  ## gemmlowp SaturatingRoundingDoublingHighMul: the high 32 bits of
-  ## 2*a*b, rounded, saturating on the single overflow case.
-  ##
-  ## Ties round toward positive infinity, *not* away from zero: the nudge is
-  ## asymmetric (`1 - 2^30` on the negative side) and the division truncates.
-  ## `roundingDivideByPOT` below uses the opposite tie rule. The asymmetry is
-  ## surprising but it is what TFLite does, so reproducing it is the point.
-  if a == low(int32) and b == low(int32):
-    return high(int32)
-  let ab = int64(a) * int64(b)
-  let nudge: int64 = if ab >= 0: (1'i64 shl 30) else: (1'i64 - (1'i64 shl 30))
-  int32((ab + nudge) div (1'i64 shl 31))
-
-func roundingDivideByPOT*(x: int32, exponent: int32): int32 {.inline.} =
-  ## gemmlowp RoundingDivideByPOT: x / 2^exponent, rounding half away from
-  ## zero. Note this is *not* an arithmetic shift — the tie handling differs.
-  ##
-  ## `exponent` reaches 31, so the mask is built in 64 bits and narrowed:
-  ## `1'i32 shl 31` does not fit an int32. gemmlowp writes `1ll << exponent`
-  ## for the same reason. This is not a theoretical case — `quantizeMultiplier`
-  ## clamps its shift at -31, and a convolution channel whose weights are all
-  ## but zero produces exactly that, which is how a real MobileNet found it.
-  if exponent == 0:
-    return x
-  let mask = int32((1'i64 shl exponent) - 1'i64)
-  let remainder = x and mask
-  let threshold = (mask shr 1) + (if x < 0: 1'i32 else: 0'i32)
-  result = (x shr exponent)
-  if remainder > threshold:
-    inc result
-
-func multiplyByQuantizedMultiplier*(x, quantizedMultiplier, shift: int32): int32 {.inline.} =
-  ## TFLite's MultiplyByQuantizedMultiplier. `shift` is positive for a left
-  ## shift applied before the multiply, negative for a right shift after.
-  let leftShift = if shift > 0: shift else: 0'i32
-  let rightShift = if shift > 0: 0'i32 else: -shift
-  roundingDivideByPOT(
-    satRoundDoublingHighMul(x * (1'i32 shl leftShift), quantizedMultiplier),
-    rightShift)
+export contract
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # AffineI8
@@ -304,17 +185,83 @@ template lutIndex*(_: typedesc[RealFp8], v: Fp8): int =
   int(v.bits)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-# CONVENIENCE CONSTRUCTORS
+# RealP8
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Every operation below except the two divisions is exact. `mac` is an exact
+# product of exact decodes into a register that cannot lose a bit until it
+# overflows, which takes 2^38 taps; `addBias` and `accumulate` are exact
+# rescalings by a power of two. So the reduction a convolution performs is
+# the real-valued reduction, and `finish` rounds it once.
+#
+# NaR does not survive arithmetic: `units` decodes it as zero, so a NaR input
+# contributes nothing to a quire rather than poisoning it. Carrying NaR
+# through would mean a flag bit in every accumulator, which is a real cost
+# paid on every model for a value no kernel here can produce — there is no
+# division and no square root in this operator set. NaR *is* preserved
+# through `lut1d`, where it costs nothing, because the host tabulates it.
 
-func noClamp*(_: typedesc[RealF32]): RealParams[float32] {.inline.} =
-  RealParams[float32](actMin: -Inf.float32, actMax: Inf.float32)
+template zeroAccum*(_: typedesc[RealP8]): Quire = 0'i64
 
-func noClamp*(_: typedesc[RealFp8]): RealParams[float32] {.inline.} =
-  RealParams[float32](actMin: -Inf.float32, actMax: Inf.float32)
+template mac*(_: typedesc[RealP8], acc: var Quire, a, b: Posit8) =
+  ## Exact. `units` is the value in 2^-6, so the product is in 2^-12 — the
+  ## quire's own units, with no shift and no rounding.
+  acc = acc + int64(units(a)) * int64(units(b))
 
-func reluClamp*(_: typedesc[RealF32]): RealParams[float32] {.inline.} =
-  RealParams[float32](actMin: 0'f32, actMax: Inf.float32)
+template addBias*(_: typedesc[RealP8], acc: var Quire, b: Posit8) =
+  acc = acc + (int64(units(b)) shl UnitScale)
 
-func reluClamp*(_: typedesc[RealFp8]): RealParams[float32] {.inline.} =
-  RealParams[float32](actMin: 0'f32, actMax: Inf.float32)
+func finish*(_: typedesc[RealP8], acc: Quire, prm: RealParams[Quire],
+             ch: int): Posit8 {.inline.} =
+  var v = acc
+  if v < prm.actMin: v = prm.actMin
+  if v > prm.actMax: v = prm.actMax
+  positFromQuire(v)
+
+template lowestStore*(_: typedesc[RealP8]): Posit8 = Posit8Min
+  ## -maxpos, not NaR. NaR does sort below it, so a NaR in a max-pool window
+  ## loses rather than winning — see the note above.
+
+template accumulate*(_: typedesc[RealP8], acc: var Quire, v: Posit8) =
+  acc = acc + (int64(units(v)) shl UnitScale)
+
+func divRoundEven(a: Quire, n: int): Quire {.inline.} =
+  ## `a / n` on the quire grid, ties to even. The only inexact step in this
+  ## policy, and it exists because a quire is fixed point: a mean has to land
+  ## back on the 2^-12 grid before it can be rounded to a posit.
+  ##
+  ## That is a double rounding, and it is worth being precise about how small
+  ## it is. The quire grid is 2^-12; the coarsest posit spacing this can
+  ## precede is 2^-6, the finest 2^-6 as well — the whole format sits on a
+  ## 2^-6 grid — so the intermediate rounding is at most half of 1/64 of a
+  ## posit ulp. It can only change an answer when the exact quotient lands
+  ## within that of a posit midpoint, and never by more than one ulp.
+  let d = Quire(n)
+  let neg = a < 0
+  let m = if neg: -a else: a
+  var q = m div d
+  let r = (m - q * d) * 2
+  if r > d or (r == d and (q and 1) == 1): inc q
+  if neg: -q else: q
+
+func divAccum*(_: typedesc[RealP8], acc: Quire, n: int): Quire {.inline.} =
+  divRoundEven(acc, n)
+
+template meanScale*(_: typedesc[RealP8], acc: Quire, count: int): Quire =
+  ## A real format has no output multiplier to fold `1/count` into, so the
+  ## division happens here — same as `RealF32` and `RealFp8`, on the quire.
+  divRoundEven(acc, count)
+
+func storeOf*(_: typedesc[RealP8], acc: Quire): Posit8 {.inline.} =
+  positFromQuire(acc)
+
+func addRescaled*(_: typedesc[RealP8], acc: var Quire, v: Posit8,
+                  mult, shift, offset: int32) {.inline.} =
+  ## Rescale parameters are meaningless for a real format; the host emits
+  ## zeros. The sum itself is exact, so a two-input add rounds exactly once.
+  acc = acc + (int64(units(v)) shl UnitScale)
+
+template lutIndex*(_: typedesc[RealP8], v: Posit8): int =
+  ## What the fp8 canary was rehearsing: a table keyed on the raw encoding,
+  ## no arithmetic on the target at all.
+  int(v.bits)
+

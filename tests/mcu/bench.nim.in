@@ -8,12 +8,12 @@
 
 ## On-target benchmark: one model, per-operator cycle counts.
 ##
-## Everything the host benchmark has to apologise for is absent here. There is
-## no scheduler, no other process, no frequency scaling and no interrupt
+## This is the only benchmark in the project, and the reason it can be. There
+## is no scheduler, no other process, no frequency scaling and no interrupt
 ## enabled anywhere in the image, so `DWT->CYCCNT` counts exactly the cycles
-## the kernel spent and counts the same number every run. The awkward part of
-## the host harness — proving that a 3% difference is real — is not a problem
-## this file has.
+## the kernel spent and counts the same number every run. Proving that a 3%
+## difference is real — the awkward part of timing anything on a desktop — is
+## not a problem this file has.
 ##
 ## What it does have is a memory system worth measuring: weights are read from
 ## flash through a prefetch buffer, a 32-line instruction cache and an 8-line

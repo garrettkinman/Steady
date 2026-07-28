@@ -4,7 +4,7 @@
 # https://opensource.org/licenses/MIT
 #
 # Joins a board's cycle counts to the operator names the compiler already
-# knows, and prints the result in the same shape as `nimble bench`.
+# knows, and prints a per-operator table from them.
 #
 # The device deliberately sends indices rather than names: an op name from a
 # real TFLite model runs to several hundred characters, and sending 31 of them

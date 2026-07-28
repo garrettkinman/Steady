@@ -17,8 +17,10 @@ import std/[unittest, tables, sequtils]
 import steadyc
 import ../examples/tiny_cnn
 import ../examples/branch_net
+import ../examples/posit_net
 import generated/tiny_cnn as model
 import generated/branch_net as branch
+import generated/posit_net as posit
 
 proc runModel(input: seq[int32]): seq[int32] =
   let inp = model.input0()
@@ -142,3 +144,69 @@ suite "end-to-end: pad, concat, mean, tanh, softmax":
     for _ in 0 ..< 5:
       check runBranch(x) == first
     check branch.ArenaSize == planOne(g).arenaSize
+
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# The same compiler over a real-number policy, against a reference whose
+# deliberate difference is the *accumulator* rather than the folding.
+#
+# The runtime reduces into an int64 quire: fixed point, integer arithmetic,
+# no floating point anywhere on the target. `simulatePosit` reduces the same
+# taps in float64 — exact for this format, since every product is an integer
+# multiple of 2^-12 — and rounds with `toPosit8`, which is derived
+# independently of the runtime's `positFromQuire`. Bit-identical output
+# therefore proves the quire exact *and* the two encoders equal.
+#
+# Inputs sweep all 256 encodings including NaR, which the policy documents as
+# decoding to zero in arithmetic and passing through a lookup table intact.
+
+proc runPosit(input: seq[Posit8]): seq[Posit8] =
+  let inp = posit.input0()
+  for i, v in input: inp[i] = v
+  posit.invoke()
+  let outp = posit.output0()
+  result = newSeq[Posit8](posit.Output0Elems)
+  for i in 0 ..< posit.Output0Elems: result[i] = outp[i]
+
+proc lcgPosits(seed: uint32, n: int): seq[Posit8] =
+  var s = seed
+  result = newSeq[Posit8](n)
+  for i in 0 ..< n:
+    s = s * 1664525'u32 + 1013904223'u32
+    result[i] = Posit8(uint8((s shr 13) and 0xFF'u32))
+
+suite "end-to-end: posit(8,0)":
+
+  let g = posit_net.buildGraph()
+
+  proc simulated(x: seq[Posit8]): seq[Posit8] =
+    var inputs = initTable[int, seq[Posit8]]()
+    inputs[g.inputs[0]] = x
+    simulatePosit(g, inputs)[g.outputs[0]]
+
+  test "generated code matches the float64 reference, bit for bit":
+    for trial in 0'u32 ..< 64'u32:
+      let x = lcgPosits(3000'u32 + trial * 5471'u32, posit.Input0Elems)
+      check runPosit(x) == simulated(x)
+
+  test "saturating and constant inputs agree too":
+    for b in [0x00'u8, 0x01'u8, 0x40'u8, 0x7F'u8, 0x80'u8, 0x81'u8, 0xC0'u8]:
+      let x = newSeqWith(posit.Input0Elems, Posit8(b))
+      check runPosit(x) == simulated(x)
+
+  test "every input encoding is exercised somewhere":
+    # A sweep rather than a sample: each of the 256 encodings is fed to the
+    # whole model at once, NaR included.
+    for b in 0 .. 255:
+      let x = newSeqWith(posit.Input0Elems, Posit8(uint8(b)))
+      check runPosit(x) == simulated(x)
+
+  test "arena is sized to the plan":
+    let p = planOne(g)
+    check posit.ArenaSize == p.arenaSize
+
+  test "invoke is repeatable — no state carried between calls":
+    let x = lcgPosits(1234'u32, posit.Input0Elems)
+    let first = runPosit(x)
+    for _ in 0 ..< 5:
+      check runPosit(x) == first

@@ -8,12 +8,12 @@
 # B-L475E-IOT01A over its ST-LINK, and read per-operator cycle counts back
 # over the virtual COM port.
 #
-# This is the measurement the host benchmark is a proxy for. The host runs an
-# out-of-order superscalar core with megabytes of cache; the target is an
-# 80 MHz Cortex-M4 reading its weights from flash through an 8-line data
-# cache. Those are different machines, and which kernel is faster is allowed
-# to differ between them — the whole point of this script is that it does not
-# have to be guessed.
+# This is the only benchmark in the project, deliberately. Timing these models
+# on a desktop core measures an out-of-order superscalar with megabytes of
+# cache and other processes on it; the target is an 80 MHz Cortex-M4 reading
+# its weights from flash through an 8-line data cache. Which kernel is faster
+# is allowed to differ between them, and has — so the proxy was removed rather
+# than kept alongside. See docs/performance.md.
 #
 #   tests/mcu/check.sh              every model that fits
 #   tests/mcu/check.sh kws vww      just these

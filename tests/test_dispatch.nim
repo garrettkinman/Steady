@@ -5,15 +5,25 @@
 
 ## Backend override.
 ##
-## The fixture in tests/fixtures/steady_backend.nim implements exactly one
-## thing: `fullyConnected` for AffineI8. Everything else must fall through
-## to the reference kernels with no forking and no stubs. Build this file
-## with `-d:steadyBackend --path:tests/fixtures`.
+## Two fixtures, at the two seams, each deliberately partial.
+##
+## tests/fixtures/steady_backend.nim implements exactly one thing:
+## `fullyConnected` for AffineI8. Everything else must fall through to the
+## reference kernels with no forking and no stubs. Build with
+## `-d:steadyBackend --path:tests/fixtures`.
+##
+## tests/fixtures/steady_arith.nim replaces policy *members* instead — `mac`
+## and the block widths, for RealP8 only — which is the seam a hardware
+## arithmetic unit plugs into. Build with `-d:steadyArith --path:tests/fixtures`.
+## Its arithmetic is identical to the default on purpose: what is under test
+## is that substituting it changes nothing observable.
 
 import std/[unittest, math]
 import steady
 when defined(steadyBackend):
   import steady_backend as be
+when defined(steadyArith):
+  import steady_arith as ar
 
 template pa[T](a: var openArray[T]): ptr UncheckedArray[T] =
   cast[ptr UncheckedArray[T]](addr a[0])
@@ -293,9 +303,79 @@ when defined(steadyBackend):
       check be.beCalls == before
       check y[0] == 30'f32
 
+    test "a policy the backend has never heard of falls back":
+      # The override is resolved per policy, so a policy added after the
+      # backend was written needs nothing from it and gets nothing.
+      let before = be.beCalls
+      var y = [Posit8Zero, Posit8Zero]
+      var x = [toPosit8(0.5), toPosit8(0.25)]
+      var w = [toPosit8(1.5), toPosit8(0.5), toPosit8(1.0), toPosit8(1.0)]
+      var b = [Posit8Zero, Posit8Zero]
+      fullyConnected(RealP8, pa(y), pa(x), pa(w), pa(b), RealP8.noClamp, 2, 2)
+      check be.beCalls == before
+      check y[0].toFloat64 == 0.875
+
     test "ops the backend does not implement fall back":
       let before = be.beCalls
       var v = [-5'i8, 0, 7]
       clamp1d(AffineI8, pa(v), pa(v), 3, 0'i8, 6'i8)
       check be.beCalls == before
       check v == [0'i8, 0, 6]
+
+when defined(steadyArith):
+  suite "arithmetic override":
+
+    test "mac for RealP8 goes to the arithmetic backend":
+      let before = ar.arithCalls
+      var y = [Posit8Zero, Posit8Zero]
+      var x = [toPosit8(0.5), toPosit8(0.25)]
+      var w = [toPosit8(1.5), toPosit8(0.5), toPosit8(1.0), toPosit8(1.0)]
+      var b = [Posit8Zero, Posit8Zero]
+      fullyConnected(RealP8, pa(y), pa(x), pa(w), pa(b), RealP8.noClamp, 2, 2)
+      check ar.arithCalls == before + 4        # one per tap, not one per op
+      check y[0].toFloat64 == 0.875            # and the answer is unchanged
+
+    test "one overridden member does not drag in the others":
+      # `finish` was not overridden, so the clamp and the rounding are still
+      # the defaults even on the op whose `mac` was replaced.
+      let prm = RealParams[Quire](actMin: 0'i64, actMax: 6 * QuireOne)
+      check finish(RealP8, Quire(9 * QuireOne), prm, 0).bits == toPosit8(6.0).bits
+
+    test "a policy the arithmetic backend does not cover falls through":
+      let before = ar.arithCalls
+      var y = [0'i8, 0]
+      var x = [4'i8, 2]
+      var w = [6'i8, 3, 1, 1]
+      var b = [0'i32, 0]
+      fullyConnected(AffineI8, pa(y), pa(x), pa(w), pa(b), affineParams(), 2, 2)
+      check ar.arithCalls == before
+      check y[0] == 15'i8
+
+    test "kernels that do not multiply never reach it":
+      let before = ar.arithCalls
+      var v = [toPosit8(-3.0), toPosit8(0.5), toPosit8(9.0)]
+      clamp1d(RealP8, pa(v), pa(v), 3, toPosit8(0.0), toPosit8(6.0))
+      check ar.arithCalls == before
+      check v[0].toFloat64 == 0.0
+
+    test "the block width is 1 here, and the results are the same anyway":
+      # The fixture sets every block width to 1 for RealP8, so these kernels
+      # take their unblocked path. Each accumulator is supposed to see the
+      # same taps in the same order whatever the blocking; this is a nine-row
+      # matmul, wide enough that a width of 4 would have blocked twice and
+      # left a remainder.
+      var y: array[9, Posit8]
+      var x: array[4, Posit8]
+      var w: array[36, Posit8]
+      var b: array[9, Posit8]
+      for i in 0 ..< 4: x[i] = toPosit8(0.25 + 0.125 * float64(i))
+      for i in 0 ..< 36: w[i] = toPosit8(0.5 - 0.03125 * float64(i mod 8))
+      for i in 0 ..< 9: b[i] = toPosit8(0.125)
+      fullyConnected(RealP8, pa(y), pa(x), pa(w), pa(b), RealP8.noClamp, 9, 4)
+      # Computed against the exact real-valued sum, rounded once — the same
+      # oracle the end-to-end posit test uses.
+      for o in 0 ..< 9:
+        var acc = 0.0
+        for i in 0 ..< 4:
+          acc += w[o * 4 + i].toFloat64 * x[i].toFloat64
+        check y[o].bits == toPosit8(acc + b[o].toFloat64).bits

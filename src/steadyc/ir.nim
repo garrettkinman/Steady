@@ -18,10 +18,10 @@ import std/[strformat, strutils, tables]
 
 type
   DType* = enum
-    dtInt8, dtInt32, dtFloat32, dtFp8
+    dtInt8, dtInt32, dtFloat32, dtFp8, dtPosit8
 
   PolicyKind* = enum
-    pkAffineI8, pkRealF32, pkRealFp8
+    pkAffineI8, pkRealF32, pkRealFp8, pkRealP8
 
   TensorKind* = enum
     tkInput        ## supplied by the caller each invocation
@@ -94,7 +94,7 @@ type
 
 func byteWidth*(d: DType): int =
   case d
-  of dtInt8, dtFp8: 1
+  of dtInt8, dtFp8, dtPosit8: 1
   of dtInt32, dtFloat32: 4
 
 func nimTypeName*(d: DType): string =
@@ -103,6 +103,7 @@ func nimTypeName*(d: DType): string =
   of dtInt32: "int32"
   of dtFloat32: "float32"
   of dtFp8: "Fp8"
+  of dtPosit8: "Posit8"
 
 func cTypeName*(d: DType): string =
   ## Fixed-width types throughout — `int` is not 32 bits everywhere these
@@ -112,24 +113,28 @@ func cTypeName*(d: DType): string =
   of dtInt32: "int32_t"
   of dtFloat32: "float"
   of dtFp8: "uint8_t"
+  of dtPosit8: "uint8_t"
 
 func policyName*(p: PolicyKind): string =
   case p
   of pkAffineI8: "AffineI8"
   of pkRealF32: "RealF32"
   of pkRealFp8: "RealFp8"
+  of pkRealP8: "RealP8"
 
 func storeType*(p: PolicyKind): DType =
   case p
   of pkAffineI8: dtInt8
   of pkRealF32: dtFloat32
   of pkRealFp8: dtFp8
+  of pkRealP8: dtPosit8
 
 func biasType*(p: PolicyKind): DType =
   case p
   of pkAffineI8: dtInt32       ## accumulator units, zero point pre-folded
   of pkRealF32: dtFloat32
   of pkRealFp8: dtFp8
+  of pkRealP8: dtPosit8        ## widened into the quire exactly, by `addBias`
 
 func isAffine*(p: PolicyKind): bool = p == pkAffineI8
 
@@ -159,9 +164,9 @@ func isPerChannel*(q: Quant): bool = q.axis >= 0 and q.scales.len > 1
 # COST MODEL
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # A single number per op, computed on the host, so the benchmark can report
-# MAC/s rather than only milliseconds. Milliseconds say which op is slow;
-# MAC/s says whether that is because it does more work or because the kernel
-# is worse, and only the second is actionable.
+# MAC/s rather than only cycles. Cycles say which op is slow; MAC/s says
+# whether that is because it does more work or because the kernel is worse,
+# and only the second is actionable.
 
 func macCount*(g: Graph, op: Op): int =
   ## Multiply-accumulates one execution of `op` performs, counted the way the
