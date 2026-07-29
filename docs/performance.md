@@ -14,7 +14,7 @@ counts** back over its console. No scheduler, no other process, no frequency sca
 enabled anywhere in the image. Rerunning a measurement reproduces it to the cycle, and everything
 below is a before-and-after from it.
 
-Two boards are supported. Unless a section says otherwise, the numbers here are from the first:
+Three boards are supported. Unless a section says otherwise, the numbers here are from the first:
 
 - **`stm32l475`** — B-L475E-IOT01A: STM32L475VG, Cortex-M4 at 80 MHz, 96 KB of usable SRAM, weights
   in internal flash, flashed and reset through the on-board ST-LINK and read over its virtual COM
@@ -23,6 +23,10 @@ Two boards are supported. Unless a section says otherwise, the numbers here are 
 - **`samd51`** — Adafruit ItsyBitsy M4 Express: ATSAMD51G19A, Cortex-M4 at 120 MHz, 192 KB of SRAM,
   4 KB of unified cache. A second part rather than a faster one — see
   [On a second part](#on-a-second-part).
+- **`esp32c3`** — ESP32-C3-DevKitM-1: ESP32-C3, RISC-V at 160 MHz, 384 KB of SRAM, weights in a
+  serial flash the core reaches only through a page table and a 16 KB cache. A second *instruction
+  set*, and the first part where the answer differs — see
+  [On a part that is not an ARM](#on-a-part-that-is-not-an-arm).
 
 It exists because "the reference kernels are unoptimized" is not a measurement and neither is an
 argument about which loop to fix.
@@ -168,6 +172,87 @@ And an image that fails to enumerate **hands itself back to the bootloader** aft
 On a part whose only route in is USB, that is the difference between a bad build costing a reflash
 and a bad build costing someone walking over to the board to double-tap a button. The first one cost
 the latter, which is why the second exists.
+
+## On a part that is not an ARM
+
+`--board esp32c3` runs the same six on an ESP32-C3-DevKitM-1: one RISC-V core (RV32IMC) at 160 MHz,
+384 KB of SRAM, 4 MB of flash. It was added to ask the question the SAMD51 could not, because the
+SAMD51 agreed: how much of the table above survives changing the instruction set *and* the way the
+part gets to its weights.
+
+| model | KB of weights per MMAC | STM32L475 cycles | ESP32-C3 cycles | ratio |
+|---|---|---|---|---|
+| `fomo` | 4 | 103,255,958 | 109,865,046 | 1.06 |
+| `resnet8` | 6 | 149,371,445 | 171,219,533 | 1.15 |
+| `kws` | 9 | 43,169,869 | 41,965,806 | 0.97 |
+| `vww` | 29 | 114,544,319 | 150,680,790 | 1.32 |
+| `person_detect` | 30 | 112,660,040 | 155,059,564 | 1.38 |
+| `ad` | 1019 | 2,413,782 | 4,823,075 | 2.00 |
+
+The kernels survive; the memory system does not. Where the SAMD51 was flat at 0.96–0.98 across every
+model, this part ranges over 2x — and the first column accounts for the ends of it. This flash is a
+serial SPI part read through 16 KB of cache, where both Cortex-M4s read a parallel flash on the
+core's own bus. `ad` is ten stacked fully-connected layers: 265 KB of weights, each used once,
+0.26 MMAC of arithmetic to hide the reads behind. It pays double. `fomo` and `resnet8`, which reuse
+what they load, pay 6–15% for a different ISA compiling the same kernel source.
+
+The middle of that range is not ordered by the first column — `kws` at 9 KB/MMAC beats the STM32
+outright while `resnet8` at 6 loses by 15% — so bytes-per-MAC is the explanation at the extremes and
+not a model of the part. What it does establish is the shape of the answer: this project's numbers
+have been a property of the kernels on every part so far, and the first place that stops being true
+is where the weights stop fitting behind the cache.
+
+Two other things this port settles.
+
+**The per-operator ratio holds across the ISA**, and widens exactly where it should. On `kws`, with
+each part's caching fully enabled — the only configuration this one has, so the comparison is against
+the others' equivalent row rather than their cacheless one:
+
+| | `Conv2d` | `DepthwiseConv2d` | ratio |
+|---|---|---|---|
+| STM32L475 | 13.52 cyc/MAC | 38.16 | 2.82 |
+| SAMD51 | 13.35 | 36.95 | 2.77 |
+| ESP32-C3 | 12.58 | 40.74 | 3.24 |
+
+The RISC-V core is the *fastest* of the three at convolution and the slowest at depthwise
+convolution, which is the bandwidth story again at operator granularity: depthwise has the lower
+arithmetic intensity, so it is the operator that notices a narrower path to weights. A memory-bound
+operator is memory-bound on a third architecture, and more so on the part with the least memory
+bandwidth to hide behind.
+
+**There is nothing to sweep.** The benchmark asks each board how many flash configurations it has and
+this one answers one, because the cache here is not in front of the path to flash, it *is* the path:
+the MMU translates into it, nothing addresses flash around it, and the kernels are being fetched
+through it as well as the weights. A cacheless row on this part is not a slow configuration, it is
+not a configuration.
+
+Every output checksum matches all three parts, on all six models.
+
+### What the port cost
+
+The same three files as the SAMD51, plus a `startup.c` — the shared one is a Cortex-M vector table —
+and, above the board directory, a toolchain prefix and a Nim `--cpu` where `arm-none-eabi-` and
+`--cpu:arm` had been hardcoded. That is the whole of what a second instruction set cost the harness.
+
+The part itself cost more, and all of it is in `board.c`. Three findings are worth writing down
+because each one presents as a hang rather than as an error:
+
+- **The core cannot address flash.** Kernels and weights are linked into two windows that a
+  128-entry page table maps onto flash pages, through a cache that is shut off from both buses at
+  reset. The table is written to the identity, so a mapped address is its own flash offset and the
+  linker script can simply name the offsets `board.sh` writes to — the alternative couples a linker
+  script to a flasher by page number, and getting that wrong reads plausible rubbish out of the
+  wrong part of flash rather than failing.
+- **Nothing that runs before the mapping may call a compiler helper.** Measuring the core clock ahead
+  of it hung the board, because the measurement divides a 64-bit product and libgcc's division
+  helper is linked into flash with everything else. The constraint is not "our code" — it is any
+  code, including the code the compiler emits calls to without being asked.
+- **Two standard CSRs are not implemented.** `mie` and `mcycle` both trap as illegal instructions —
+  mcause 2, mtval the instruction itself. The cycle counter is a vendor CSR (PCCR) instead, and the
+  trap handler that reports this had to be aligned to 256 bytes before it could: this core ignores
+  the low eight bits of `mtvec` and forces vectored mode, so a handler at `…02C0` is installed at
+  `…0200` and traps land in the middle of some other function. That one presented as a deliberately
+  illegal instruction *restarting the firmware* instead of parking it.
 
 ## What was changed, and why it is still bit-exact
 

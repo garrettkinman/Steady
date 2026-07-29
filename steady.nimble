@@ -70,11 +70,12 @@ task staticlib, "Package a model as a C static library and consume it from C":
 task fetch, "Download the real .tflite fixtures (checksummed)":
   exec "bash tests/models/fetch.sh"
 
-task mcu, "On-target benchmark: real models on a Cortex-M4, in cycles":
-  # Skips itself, loudly, without arm-none-eabi-gcc or a board — see
-  # tests/mcu/check.sh. Which board is found is reported rather than assumed,
-  # and with more than one attached it asks: set STEADY_MCU_BOARD, or call the
-  # script directly as `tests/mcu/check.sh --board <name> [model...]`.
+task mcu, "On-target benchmark: real models on real hardware, in cycles":
+  # Skips itself, loudly, without a board or the cross compiler that board
+  # asks for — see tests/mcu/check.sh. Which board is found is reported rather
+  # than assumed, and with more than one attached it asks: set
+  # STEADY_MCU_BOARD, or call the script directly as
+  # `tests/mcu/check.sh --board <name> [model...]`.
   exec "bash tests/mcu/check.sh"
 
 task models, "Differential harness: real models against TFLite's own kernels":

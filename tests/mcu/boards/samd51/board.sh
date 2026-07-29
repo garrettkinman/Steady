@@ -103,6 +103,10 @@ samd51_touch_1200() {
 # ~~ the contract ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 board_probe() {
+  command -v "${BOARD_CROSS}gcc" >/dev/null 2>&1 || {
+    echo "    ${BOARD_CROSS}gcc not found; this board needs the ARM cross compiler"
+    return 1
+  }
   command -v udevadm >/dev/null 2>&1 || {
     echo "    udevadm not found; needed to tell this board's serial port from any other"
     return 1

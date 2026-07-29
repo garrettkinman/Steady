@@ -18,7 +18,8 @@
 #   tests/mcu/check.sh kws vww                just these
 #   tests/mcu/check.sh --board samd51 kws     on a named board
 #
-# Needs arm-none-eabi-gcc and a board. Skips itself, loudly, without either.
+# Needs a board and the cross compiler that board asks for. Skips itself,
+# loudly, without either.
 #
 # ~~ adding a board ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #
@@ -40,20 +41,28 @@
 # a linker script, and a board.sh defining
 #
 #   BOARD_LABEL       what to print
+#   BOARD_CROSS       cross-toolchain prefix, e.g. arm-none-eabi-
+#   BOARD_NIMCPU      what to pass Nim's --cpu
 #   BOARD_MCPU        architecture flags for the cross compiler
+#   BOARD_LDFLAGS     extra flags for the link, if the toolchain wants any
 #   BOARD_SOURCES     C files in the board directory, space separated
+#   BOARD_STARTUP     startup file, if the shared Cortex-M one does not fit
 #   BOARD_LD          linker script in the board directory
 #   BOARD_RODATA_RE   what a flash address looks like in `nm` output, so the
 #                     placement audit can tell flash from RAM on this part
 #   board_probe       0 if the board is usable, else a printed reason
 #   board_console     the path to read records from
-#   board_flash       program $1/image.elf (or image.bin) onto it
+#   board_image       turn $1/image.elf into whatever board_flash wants;
+#                     the default is a flat binary and two of the three boards
+#                     take it
+#   board_flash       program it onto the board
 #
-# The two that exist differ about as much as two Cortex-M4s can — one is
-# programmed through a debug probe and talks over a bridge chip's UART, the
-# other is programmed by copying a file onto a bootloader's mass-storage
-# volume and talks over a CDC endpoint its own firmware implements — and
-# neither fact reaches any file above this line.
+# The three that exist differ about as much as three parts can. One is
+# programmed through a debug probe and talks over a bridge chip's UART; one is
+# programmed by copying a file onto a bootloader's mass-storage volume and
+# talks over a CDC endpoint its own firmware implements; one is a different
+# instruction set entirely, whose flash the core cannot address without first
+# building a page table for it. None of that reaches any file above this line.
 
 set -euo pipefail
 
@@ -80,12 +89,21 @@ if [ ${#MODELS[@]} -eq 0 ]; then
   read -r -a MODELS <<<"${STEADY_MCU_MODELS:-$DEFAULT_MODELS}"
 fi
 
-if ! command -v arm-none-eabi-gcc >/dev/null 2>&1; then
-  echo "==> arm-none-eabi-gcc not found; skipping the on-target benchmark"
-  exit 0
-fi
-
 # ~~ pick a board ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#
+# Defaults every board inherits and any board may override, defined before the
+# first board.sh is sourced. The cross compiler is a board's own business now
+# rather than this file's: with two instruction sets among three boards there
+# is no single toolchain whose absence means "skip the benchmark", so each
+# board reports its own missing compiler through board_probe like any other
+# reason it cannot be used.
+
+BOARD_CROSS="arm-none-eabi-"
+BOARD_NIMCPU="arm"
+BOARD_LDFLAGS="--specs=nosys.specs --specs=nano.specs"
+BOARD_STARTUP=""                  # empty: the shared Cortex-M startup.c
+
+board_image() { "${BOARD_CROSS}objcopy" -O binary "$1/image.elf" "$1/image.bin"; }
 
 BOARDS=()
 for d in "$DIR"/boards/*/; do BOARDS+=("$(basename "$d")"); done
@@ -139,6 +157,13 @@ echo "==> Target  $BOARD — $BOARD_LABEL"
 
 CFLAGS="-c -Os -ffreestanding -ffunction-sections -fdata-sections -Wall $BOARD_MCPU"
 
+# The shared startup, unless the board brought one. What is shared is a
+# Cortex-M vector table and reset handler, so a board on another instruction
+# set supplies its own rather than that file growing a `#if` about which core
+# it is being compiled for.
+STARTUP="${BOARD_STARTUP:+$BDIR/$BOARD_STARTUP}"
+STARTUP="${STARTUP:-$DIR/startup.c}"
+
 for name in "${MODELS[@]}"; do
   model="$ROOT/tests/models/$name.tflite"
   [ -f "$model" ] || { echo "==> $name: not fetched, skipping"; continue; }
@@ -157,29 +182,30 @@ for name in "${MODELS[@]}"; do
   # Nim to C only; the cross compiler does the rest, exactly as the
   # freestanding check does.
   nim c --hints:off --path:"$ROOT/src" --path:"$ROOT/tests/freestanding" \
-        --os:any --cpu:arm --mm:none --panics:on --noMain \
+        --os:any --cpu:"$BOARD_NIMCPU" --mm:none --panics:on --noMain \
         --compileOnly --nimcache:"$out/nimcache" \
         -d:danger -d:steadyProfile -d:useMalloc -d:steadyNonce="$NONCE" \
         "$out/bench.nim" >/dev/null
 
+  CC="${BOARD_CROSS}gcc"
   ( cd "$out/nimcache"
-    for f in *.c; do arm-none-eabi-gcc $CFLAGS -w -I"$NIMLIB" -o "${f%.c}.o" "$f"; done )
-  arm-none-eabi-gcc $CFLAGS -w -I"$NIMLIB" -o "$out/weights.o" "$out/${name}_weights.c"
-  arm-none-eabi-gcc $CFLAGS -o "$out/startup.o" "$DIR/startup.c"
+    for f in *.c; do "$CC" $CFLAGS -w -I"$NIMLIB" -o "${f%.c}.o" "$f"; done )
+  "$CC" $CFLAGS -w -I"$NIMLIB" -o "$out/weights.o" "$out/${name}_weights.c"
+  "$CC" $CFLAGS -o "$out/startup.o" "$STARTUP"
   BOARD_OBJS=()
   for src in $BOARD_SOURCES; do
-    arm-none-eabi-gcc $CFLAGS -o "$out/${src%.c}.o" "$BDIR/$src"
+    "$CC" $CFLAGS -o "$out/${src%.c}.o" "$BDIR/$src"
     BOARD_OBJS+=("$out/${src%.c}.o")
   done
 
-  arm-none-eabi-gcc -o "$out/image.elf" \
+  "$CC" -o "$out/image.elf" \
     "$out/startup.o" "${BOARD_OBJS[@]}" "$out/weights.o" "$out"/nimcache/*.o \
     $BOARD_MCPU -nostartfiles -T"$BDIR/$BOARD_LD" \
     -Wl,--gc-sections -Wl,-Map="$out/image.map" \
-    --specs=nosys.specs --specs=nano.specs
+    $BOARD_LDFLAGS
 
-  arm-none-eabi-objcopy -O binary "$out/image.elf" "$out/image.bin"
-  arm-none-eabi-size "$out/image.elf" | sed 's/^/    /'
+  board_image "$out"
+  "${BOARD_CROSS}size" "$out/image.elf" | sed 's/^/    /'
 
   # Same audit the freestanding check runs. A benchmark image that quietly
   # linked an allocator would still produce numbers, and they would be numbers
@@ -190,7 +216,7 @@ for name in "${MODELS[@]}"; do
   # match early enough to exit before nm has finished writing: nm takes a
   # SIGPIPE, and its status becomes the pipeline's. The audit then fails at
   # random, on a correct image, which is worse than not auditing at all.
-  arm-none-eabi-nm "$out/image.elf" > "$out/symbols.txt"
+  "${BOARD_CROSS}nm" "$out/image.elf" > "$out/symbols.txt"
   if grep -iqE " (T|t|W) .*(malloc|calloc|realloc|_sbrk|newObj|nimGC)" "$out/symbols.txt"; then
     echo "FAIL: an allocator is reachable from the benchmark image"
     exit 1

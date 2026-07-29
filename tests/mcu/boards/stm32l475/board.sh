@@ -28,6 +28,10 @@ PYOCD="${STEADY_MCU_PYOCD:-pyocd}"
 command -v "$PYOCD" >/dev/null 2>&1 || PYOCD="$ROOT/.venv/bin/pyocd"
 
 board_probe() {
+  if ! command -v "${BOARD_CROSS}gcc" >/dev/null 2>&1; then
+    echo "    ${BOARD_CROSS}gcc not found; this board needs the ARM cross compiler"
+    return 1
+  fi
   if ! command -v "$PYOCD" >/dev/null 2>&1; then
     echo "    pyocd not found; pip install pyocd, and give the probe a udev rule:"
     echo '    SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="374b", MODE="0666", TAG+="uaccess"'

@@ -241,8 +241,8 @@ Measured where it matters: on the part. `nimble mcu` builds a firmware image per
 board and reads per-operator **cycle counts** back over its console — no scheduler, no other process,
 no frequency scaling, no interrupt enabled anywhere in the image. Rerunning a measurement reproduces
 it to the cycle. The reference board is a B-L475E-IOT01A (STM32L475VG, Cortex-M4 at 80 MHz, 96 KB
-usable SRAM, weights in internal flash); a second part is
-[below](#the-same-compiler-on-a-second-part).
+usable SRAM, weights in internal flash); [a second part](#the-same-compiler-on-a-second-part) and
+[a third that is not an ARM at all](#and-a-part-that-is-not-a-cortex-m) are below.
 
 MAC counts come from the compiler's own `macCount`, padded taps included, since those are multiplied
 against `padValue` rather than skipped. Arena and flash are the compiler's own report. Cycles are
@@ -287,6 +287,53 @@ Where the two genuinely differ is how much that memory system is worth. The SAMD
 its cacheless row is correspondingly worse (48.8 cyc/MAC against 34.4), because five flash wait states
 at 120 MHz with nothing in front of them is what that costs. Every output checksum is identical on
 the two parts, which is the claim the whole compiler rests on and now has two witnesses.
+
+### And a part that is not a Cortex-M
+
+`--board esp32c3` runs the same six on an ESP32-C3-DevKitM-1: a single RISC-V core (RV32IMC) at
+160 MHz, 384 KB of SRAM, and 4 MB of flash the core **cannot address**. It reaches flash through a
+128-entry page table into a 16 KB cache, and nothing is mapped when the image starts — so this port
+programs that table before it can call a kernel or read a weight.
+
+The six models, and the same models' cycle counts on the STM32 for scale:
+
+| model | KB/MMAC | MMAC | cycles | ms | cyc/MAC | MMAC/s | vs STM32, cycles |
+|---|---|---|---|---|---|---|---|
+| `resnet8` | 6 | 12.50 | 171,219,533 | 1070.1 | 13.70 | 11.7 | 1.15x |
+| `kws` | 9 | 2.66 | 41,965,806 | 262.3 | 15.80 | 10.1 | 0.97x |
+| `ad` | 1019 | 0.26 | 4,823,075 | 30.1 | 18.26 | 8.8 | 2.00x |
+| `vww` | 29 | 7.49 | 150,680,790 | 941.8 | 20.12 | 8.0 | 1.32x |
+| `fomo` | 4 | 5.40 | 109,865,046 | 686.7 | 20.34 | 7.9 | 1.06x |
+| `person_detect` | 30 | 7.16 | 155,059,564 | 969.1 | 21.66 | 7.4 | 1.38x |
+
+The last column is where this board earns its place, and it says something the second one could not.
+The SAMD51 landed within 2–4% of the STM32 on every model, which is what "same core, different
+vendor" should look like. A different instruction set lands within 15% on the models that are
+compute-bound and **2x worse on `ad`** — and the first column says why. `ad` needs roughly one byte
+of weights per MAC: ten stacked fully-connected layers use each int8 weight exactly once, so there is
+no reuse for a cache to find. The ESP32-C3's flash is a serial part read over SPI through 16 KB of
+cache, where both Cortex-M4s read a parallel flash on the core's own bus. Models that reuse their
+weights do not notice. A model that streams 265 KB of them per inference notices twice over.
+
+That is worth more than the agreement was. Two Cortex-M4s agreeing says the numbers are a property
+of these kernels; a third part disagreeing *only where bandwidth is the limit* says which numbers are
+a property of the kernels and which were a property of having flash on the bus.
+
+In wall-clock terms the extra clock mostly pays for it: this part is faster than *both* Cortex-M4s on
+three of the six — `kws` in 262 ms against 353 on the SAMD51 and 540 on the STM32 — and faster than
+the 80 MHz STM32 on all six, if only by a hair on `ad`. Cycles are what this table is for, but which
+part finishes first is a different question and worth answering separately.
+
+There is no cacheless row, and that is structural rather than an omission. On both Cortex-M4s the
+accelerators in front of flash are an optimisation: switch them off and the core still reads flash,
+only slowly, which is what makes "everything off" the honest number for a part without them. Here the
+cache is not in front of the path to flash, it *is* the path — disabling it does not produce a slow
+read, it produces no read at all, and the kernels are being fetched through it too. The benchmark asks
+each board how many configurations it has, so this one answers one.
+
+**Every output checksum is identical to both Cortex-M4s' on all six models.** Two instruction sets,
+three vendors, one set of answers, bit for bit — and this third witness shares no arithmetic
+hardware with either of the other two.
 
 The kernel work in [docs/performance.md](docs/performance.md) is worth **2.17x on `kws`** and
 **2.02x on `vww`** against the unoptimized reference kernels, and the flash accelerators are worth
@@ -334,13 +381,15 @@ nimble fetch                                    # five published models
 .venv/bin/python tests/models/convert.py        # mobilenet_v2 and fomo
 ```
 
-`mcu` needs `arm-none-eabi-gcc` and a board on USB. Two are supported, it reports which one it found
-rather than assuming, and with both attached it asks — their numbers are not comparable:
+`mcu` needs a board on USB and the cross compiler that board asks for. Three are supported, it
+reports which one it found rather than assuming, and with more than one attached it asks — their
+numbers are not comparable:
 
-| `--board` | part | how it is reached |
-|---|---|---|
-| `stm32l475` | STM32L475VG @ 80 MHz, 96 KB SRAM (B-L475E-IOT01A) | ST-LINK, via `pyocd` |
-| `samd51` | ATSAMD51G19A @ 120 MHz, 192 KB SRAM (Adafruit ItsyBitsy M4 Express) | its own USB |
+| `--board` | part | toolchain | how it is reached |
+|---|---|---|---|
+| `stm32l475` | STM32L475VG @ 80 MHz, 96 KB SRAM (B-L475E-IOT01A) | `arm-none-eabi-` | ST-LINK, via `pyocd` |
+| `samd51` | ATSAMD51G19A @ 120 MHz, 192 KB SRAM (Adafruit ItsyBitsy M4 Express) | `arm-none-eabi-` | its own USB |
+| `esp32c3` | ESP32-C3 @ 160 MHz, 384 KB SRAM (ESP32-C3-DevKitM-1) | `riscv32-esp-elf-` | its boot ROM, via `esptool` |
 
 The ST-LINK needs `pyocd` and a udev rule to be usable without root:
 
@@ -358,10 +407,20 @@ counter is supposed to be free of. An image that fails to enumerate hands itself
 bootloader after a minute, which is what keeps a bad build from being unrecoverable on a part with no
 other way in.
 
-Porting to a third is [tests/mcu/boards/](tests/mcu/boards/): a `board.c` implementing the entry
+The DevKitM-1 needs Espressif's RISC-V toolchain and `esptool`, and neither a probe nor a udev rule:
+it is programmed by its own boot ROM over the same USB bridge the console arrives on. The harness
+finds the toolchain under `~/.espressif` if an esp-idf install put it there, which is where it is not
+on `PATH`. Nothing else of esp-idf is used or needed — no SDK, no second-stage bootloader, no
+FreeRTOS. The image is three pieces at three flash offsets, because on this part flash is not
+addressable until software has built a page table for it; see
+[tests/mcu/boards/esp32c3/board.ld](tests/mcu/boards/esp32c3/board.ld).
+
+Porting to a fourth is [tests/mcu/boards/](tests/mcu/boards/): a `board.c` implementing the entry
 points the benchmark calls, a linker script, and a `board.sh` saying how to find the board and get an
 image onto it. A clock, a console, a 32-bit counter, a memory map and whatever sits in front of flash
-— no vendor HAL in either of the two that exist.
+— no vendor HAL in any of the three that exist. The RISC-V port also brought its own `startup.c` and
+taught the harness a toolchain prefix and a Nim `--cpu`, which is the whole of what a second
+instruction set cost above the board directory.
 
 Every optional check skips itself, loudly, when its dependency is missing. A missing tool is not a
 failure, but quietly reporting success would be.
@@ -396,6 +455,11 @@ Done:
 - [x] A second board behind the same harness — an ATSAMD51G19A reached over nothing but USB, with a
       polled CDC console the firmware serves itself so that no interrupt exists to land inside a
       measurement. Same checksums, and cycle counts within 4% of the first part's
+- [x] A third board that is not an ARM: an ESP32-C3, RISC-V, whose flash the core cannot address
+      until the firmware has built the page table for it. Same checksums on all six models across
+      two instruction sets, and the first result the harness has produced that is *not* a property
+      of the kernels — where a model is bandwidth-bound rather than compute-bound, serial flash
+      costs it 2x
 - [x] The portable kernel work that benchmark justified: up to 2.2x on a Cortex-M4, with the
       bit-exactness unchanged, digit for digit
 
