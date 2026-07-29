@@ -15,7 +15,7 @@
 
 ## One import covers the chain: `dispatch` re-exports `arith` (the
 ## dispatching policy members), which re-exports `contract` (the tags,
-## associated types and params), which re-exports the numeric formats.
+## associated types and params).
 ##
 ## Deliberately *not* `policy`. Its members are the undispatched defaults, and
 ## having both those and `arith`'s in scope would make every call site

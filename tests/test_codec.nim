@@ -47,34 +47,6 @@ suite "storage codecs":
     check quantizedValue(pkAffineI8, unitQ, 1.0) == 127'i32        # saturating
     check quantizedValue(pkAffineI8, unitQ, -1.0) == -128'i32
 
-  test "fp8 decode and encode agree with the runtime's own conversions":
-    for raw in 0 ..< LutSize:
-      let f = Fp8(uint8(raw)).toFloat32
-      if f != f: continue                                          # the one NaN
-      check decodeStore(pkRealFp8, Quant(), raw) == float64(f)
-      check encodeStore(pkRealFp8, Quant(), float64(f)) == raw
-
-  test "posit decode and encode agree with the runtime's own conversions":
-    for raw in 0 ..< LutSize:
-      let p = Posit8(uint8(raw))
-      if p.isNaR:
-        # NaR has no real value; it decodes to NaN and encodes back from one.
-        check decodeStore(pkRealP8, Quant(), raw) != decodeStore(pkRealP8, Quant(), raw)
-        check encodeStore(pkRealP8, Quant(), NaN) == raw
-      else:
-        check decodeStore(pkRealP8, Quant(), raw) == p.toFloat64
-        check encodeStore(pkRealP8, Quant(), p.toFloat64) == raw
-
-  test "a posit encode saturates rather than wrapping":
-    check encodeStore(pkRealP8, Quant(), 1.0e9) == int(Posit8Max.bits)
-    check encodeStore(pkRealP8, Quant(), -1.0e9) == int(Posit8Min.bits)
-
-  test "RealF32 has no byte domain, and says so":
-    expect CodecError:
-      discard decodeStore(pkRealF32, Quant(), 0)
-    expect CodecError:
-      discard encodeStore(pkRealF32, Quant(), 1.0)
-
 suite "activation tables":
 
   test "a logistic table matches the true function at every input":
@@ -96,25 +68,6 @@ suite "activation tables":
       prev = v
     check int32(cast[int8](table[int(cast[uint8](-128'i8))])) == -128'i32
     check int32(cast[int8](table[int(cast[uint8](127'i8))])) == 127'i32
-
-  test "an fp8 table propagates NaN instead of inventing a value":
-    let table = buildLut(pkRealFp8, Quant(), Quant(), activationFn(okTanh))
-    check Fp8(table[int(Fp8Nan.bits)]).isNan
-    check Fp8(table[int(toFp8(0.5'f32).bits)]).toFloat32 == toFp8(tanh(0.5'f32)).toFloat32
-
-  test "a posit table propagates NaR instead of inventing a value":
-    let table = buildLut(pkRealP8, Quant(), Quant(), activationFn(okTanh))
-    check Posit8(table[int(Posit8NaR.bits)]).isNaR
-    check Posit8(table[int(toPosit8(0.5).bits)]).toFloat64 == toPosit8(tanh(0.5)).toFloat64
-    # The table is the function, rounded once: every entry, not a sample.
-    for raw in 0 ..< LutSize:
-      let p = Posit8(uint8(raw))
-      if p.isNaR: continue
-      check Posit8(table[raw]).bits == toPosit8(tanh(p.toFloat64)).bits
-
-  test "RealF32 cannot have a table built for it":
-    expect CodecError:
-      discard buildLut(pkRealF32, Quant(), Quant(), activationFn(okTanh))
 
   test "only logistic and tanh are table activations":
     expect CodecError:
@@ -216,34 +169,14 @@ suite "softmax against a float64 reference":
 suite "ops the host must reject":
 
   proc oneOpGraph(policy: PolicyKind, kind: OpKind): Graph =
-    ## Input -> op -> output, shapes chosen so only the policy is at issue.
+    ## Input -> op -> output, shapes chosen so only the op is at issue.
     let dt = policy.storeType
-    let q =
-      if policy.isAffine: Quant(scales: @[0.05], zeroPoints: @[0'i32], axis: -1)
-      else: Quant(axis: -1)
+    let q = Quant(scales: @[0.05], zeroPoints: @[0'i32], axis: -1)
     result = initGraph("reject", policy)
     let x = result.addInput("input", @[1, 4], dt, q)
     let y = result.addIntermediate("out", @[1, 4], dt, q)
     discard result.addOp Op(name: "op", kind: kind, inputs: @[x], outputs: @[y])
     result.markOutput y
-
-  test "a table activation needs an 8-bit storage type":
-    for kind in [okLogistic, okTanh]:
-      var ok8 = oneOpGraph(pkRealFp8, kind)
-      ok8.validate                                  # fp8 is fine
-      var okP = oneOpGraph(pkRealP8, kind)
-      okP.validate                                  # and so is posit8
-      var bad = oneOpGraph(pkRealF32, kind)
-      expect IrError:
-        bad.validate
-
-  test "softmax needs a uniform integer domain, so affine only":
-    var good = oneOpGraph(pkAffineI8, okSoftmax)
-    good.validate
-    for policy in [pkRealF32, pkRealFp8, pkRealP8]:
-      var bad = oneOpGraph(policy, okSoftmax)
-      expect IrError:
-        bad.validate
 
   test "softmax normalises over the last axis, once per row":
     # A classifier has one row; a detection head has one per output cell, which

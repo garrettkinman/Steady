@@ -17,7 +17,6 @@
 import steady
 import ../generated/tiny_cnn as model
 import ../generated/branch_net as branch
-import ../generated/posit_net as posit
 
 var mult = [1073741824'i32]
 var shift = [0'i32]
@@ -70,22 +69,3 @@ proc steady_branch_output(): ptr UncheckedArray[int8] {.exportc, cdecl.} =
 
 proc steady_branch_arena_size(): int32 {.exportc, cdecl.} =
   int32(branch.ArenaSize)
-
-# The third model is a *real-number* policy: posit(8,0) storage, an int64
-# quire, and a 256-entry decode table that belongs in flash like any other
-# constant. Nothing in it may reach for libm or a software float — the whole
-# point of a fixed-point quire is that a part with no FPU never needs one —
-# and the placement audit checks the table's section for the same reason it
-# checks an activation table's.
-
-proc steady_posit_invoke() {.exportc, cdecl.} =
-  posit.invoke()
-
-proc steady_posit_input(): ptr UncheckedArray[Posit8] {.exportc, cdecl.} =
-  posit.input0()
-
-proc steady_posit_output(): ptr UncheckedArray[Posit8] {.exportc, cdecl.} =
-  posit.output0()
-
-proc steady_posit_arena_size(): int32 {.exportc, cdecl.} =
-  int32(posit.ArenaSize)

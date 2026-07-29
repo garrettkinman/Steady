@@ -5,11 +5,11 @@
 
 ## Host-side quantization resolution.
 ##
-## Everything here happens at build time. Its job is to absorb the
-## difference between affine-integer and real-number formats so that the
-## kernels do not have to: it computes Q31 requantization multipliers, folds
+## Everything here happens at build time. Its job is to keep quantization out
+## of the kernels entirely: it computes Q31 requantization multipliers, folds
 ## input zero-point correction into the int32 bias, and reduces fused
-## activations to plain clamp bounds.
+## activations to plain clamp bounds. The kernels never see a scale or a zero
+## point, only a multiplier, a shift and two bounds.
 ##
 ## The folding identity, for symmetric weights (Zw = 0, which TFLite
 ## mandates for int8 conv and fully-connected weights):
@@ -28,13 +28,9 @@ import ./ir
 type
   ResolvedParams* = object
     ## What the emitter needs to materialise a `Params(P)` value.
-    case affine*: bool
-    of true:
-      mult*, shift*: seq[int32]     ## one entry (per-tensor) or one per channel
-      outZeroPoint*: int32
-      qActMin*, qActMax*: int32
-    of false:
-      fActMin*, fActMax*: float32
+    mult*, shift*: seq[int32]       ## one entry (per-tensor) or one per channel
+    outZeroPoint*: int32
+    qActMin*, qActMax*: int32
 
   AddRescale* = object
     aMult*, aShift*, bMult*, bShift*: int32
@@ -137,13 +133,6 @@ proc affineActRange*(fused: FusedAct, outQ: Quant): (int32, int32) =
   of faRelu6:      (max(-128'i32, z), quantizeValue(6.0, s, z))
   of faReluN1To1:  (quantizeValue(-1.0, s, z), quantizeValue(1.0, s, z))
 
-proc realActRange*(fused: FusedAct): (float32, float32) =
-  case fused
-  of faNone:       (-Inf.float32, Inf.float32)
-  of faRelu:       (0'f32, Inf.float32)
-  of faRelu6:      (0'f32, 6'f32)
-  of faReluN1To1:  (-1'f32, 1'f32)
-
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # PARAMETER RESOLUTION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -151,16 +140,12 @@ proc realActRange*(fused: FusedAct): (float32, float32) =
 proc resolveMatmulParams*(g: Graph, inT, wT, outT: Tensor,
                           fused: FusedAct, outChannels: int): ResolvedParams =
   ## Requantization for the matmul family: conv, depthwise, fully-connected.
-  if not g.policy.isAffine:
-    let (lo, hi) = realActRange(fused)
-    return ResolvedParams(affine: false, fActMin: lo, fActMax: hi)
-
   let inScale = inT.quant.scaleAt(0)
   let outScale = outT.quant.scaleAt(0)
   let perChannel = wT.quant.isPerChannel
   let n = if perChannel: outChannels else: 1
 
-  result = ResolvedParams(affine: true)
+  result = ResolvedParams()
   result.mult = newSeq[int32](n)
   result.shift = newSeq[int32](n)
   for c in 0 ..< n:
@@ -180,11 +165,6 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
   ## them into. TFLite pre-shifts both operands left by 20 to preserve
   ## precision, so each input multiplier is taken relative to a common
   ## domain 2^20 times finer than the larger input scale.
-  if not g.policy.isAffine:
-    let (lo, hi) = realActRange(fused)
-    return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi),
-            AddRescale())
-
   const LeftShift = RescaleLeftShift
   let aScale = aT.quant.scaleAt(0)
   let bScale = bT.quant.scaleAt(0)
@@ -198,7 +178,7 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
   let (bm, bsh) = quantizeMultiplier(realB)
   let (om, osh) = quantizeMultiplier(realOut)
 
-  var params = ResolvedParams(affine: true)
+  var params = ResolvedParams()
   params.mult = @[om]
   params.shift = @[osh]
   params.outZeroPoint = outT.quant.zeroAt(0)
@@ -224,11 +204,6 @@ proc resolveConcatParams*(g: Graph, ins: openArray[Tensor], outT: Tensor,
   ## not requiring an FPU; results can differ from TFLite by an LSB when the
   ## quantizations differ, and are identical when they agree, because then the
   ## emitter skips the arithmetic entirely.
-  if not g.policy.isAffine:
-    let (lo, hi) = realActRange(fused)
-    return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi),
-            newSeq[OperandRescale](ins.len))
-
   var maxScale = 0.0
   for t in ins:
     maxScale = max(maxScale, t.quant.scaleAt(0))
@@ -242,7 +217,7 @@ proc resolveConcatParams*(g: Graph, ins: openArray[Tensor], outT: Tensor,
 
   let (om, osh) = quantizeMultiplier(
     twiceMax / (float64(1 shl RescaleLeftShift) * outScale))
-  var params = ResolvedParams(affine: true)
+  var params = ResolvedParams()
   params.mult = @[om]
   params.shift = @[osh]
   params.outZeroPoint = outT.quant.zeroAt(0)
@@ -260,17 +235,13 @@ proc resolveMeanParams*(g: Graph, inT, outT: Tensor, count: int,
   ##
   ## The multiplier also carries the `1/count` of the mean itself — see
   ## `meanScale` in the runtime's policy module.
-  if not g.policy.isAffine:
-    let (lo, hi) = realActRange(fused)
-    return (ResolvedParams(affine: false, fActMin: lo, fActMax: hi), 0'i32)
-
   # The division by `count` rides along in the multiplier, so the kernel
   # accumulates and requantizes with a single rounding step. Dividing in the
   # kernel first would round to the input's integer grid and lose up to half an
   # LSB before the requantization even starts.
   let effective = inT.quant.scaleAt(0) / (float64(count) * outT.quant.scaleAt(0))
   let (m, s) = quantizeMultiplier(effective)
-  var params = ResolvedParams(affine: true)
+  var params = ResolvedParams()
   params.mult = @[m]
   params.shift = @[s]
   params.outZeroPoint = outT.quant.zeroAt(0)
@@ -289,13 +260,9 @@ proc resolveSoftmaxParams*(g: Graph, outT: Tensor): ResolvedParams =
   ## fixes int8 softmax output at scale 1/256, zero point -128; any positive
   ## output scale works here, and probabilities above the representable range
   ## clamp rather than wrap.
-  if not g.policy.isAffine:
-    raise newException(QuantError,
-      "softmax is an integer-affine op; the host should have rejected it " &
-      "during validation for this policy")
   let (m, s) = quantizeMultiplier(
     1.0 / (float64(1 shl SoftmaxProbBits) * outT.quant.scaleAt(0)))
-  result = ResolvedParams(affine: true)
+  result = ResolvedParams()
   result.mult = @[m]
   result.shift = @[s]
   result.outZeroPoint = outT.quant.zeroAt(0)
@@ -309,10 +276,7 @@ proc resolveSoftmaxParams*(g: Graph, outT: Tensor): ResolvedParams =
 
 proc foldBias*(g: Graph, op: Op): seq[byte] =
   ## Returns replacement bias data with the input zero-point correction
-  ## folded in. A no-op for real-number policies, which have no zero points.
-  if not g.policy.isAffine:
-    return g.tensors[op.inputs[2]].data
-
+  ## folded in.
   let inT = g.tensors[op.inputs[0]]
   let wT = g.tensors[op.inputs[1]]
   let bT = g.tensors[op.inputs[2]]
@@ -355,7 +319,7 @@ proc foldBias*(g: Graph, op: Op): seq[byte] =
   fromInt32(bias)
 
 proc padValueFor*(g: Graph, inT: Tensor): int32 =
-  ## The value padded taps are multiplied against. For affine this is the
-  ## input zero point, which is exactly what keeps the folded bias valid at
-  ## the edges; for real formats it is plain zero.
-  if g.policy.isAffine: inT.quant.zeroAt(0) else: 0'i32
+  ## The value padded taps are multiplied against: the input zero point, which
+  ## is exactly what keeps the folded bias valid at the edges. Padding with a
+  ## literal zero would be padding with `-Zx` in real terms.
+  inT.quant.zeroAt(0)

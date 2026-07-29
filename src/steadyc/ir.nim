@@ -18,10 +18,14 @@ import std/[strformat, strutils, tables]
 
 type
   DType* = enum
-    dtInt8, dtInt32, dtFloat32, dtFp8, dtPosit8
+    dtInt8, dtInt32, dtFloat32
 
   PolicyKind* = enum
-    pkAffineI8, pkRealF32, pkRealFp8, pkRealP8
+    ## One policy ships. The enum stays because the emitted module names its
+    ## policy and because the numeric-policy seam is the compiler's shape, not
+    ## because a second value is expected soon — see `steady/contract.nim` for
+    ## what the abstraction is actually for, and what was removed from it.
+    pkAffineI8
 
   TensorKind* = enum
     tkInput        ## supplied by the caller each invocation
@@ -94,7 +98,7 @@ type
 
 func byteWidth*(d: DType): int =
   case d
-  of dtInt8, dtFp8, dtPosit8: 1
+  of dtInt8: 1
   of dtInt32, dtFloat32: 4
 
 func nimTypeName*(d: DType): string =
@@ -102,8 +106,6 @@ func nimTypeName*(d: DType): string =
   of dtInt8: "int8"
   of dtInt32: "int32"
   of dtFloat32: "float32"
-  of dtFp8: "Fp8"
-  of dtPosit8: "Posit8"
 
 func cTypeName*(d: DType): string =
   ## Fixed-width types throughout — `int` is not 32 bits everywhere these
@@ -112,37 +114,24 @@ func cTypeName*(d: DType): string =
   of dtInt8: "int8_t"
   of dtInt32: "int32_t"
   of dtFloat32: "float"
-  of dtFp8: "uint8_t"
-  of dtPosit8: "uint8_t"
 
 func policyName*(p: PolicyKind): string =
   case p
   of pkAffineI8: "AffineI8"
-  of pkRealF32: "RealF32"
-  of pkRealFp8: "RealFp8"
-  of pkRealP8: "RealP8"
 
 func storeType*(p: PolicyKind): DType =
   case p
   of pkAffineI8: dtInt8
-  of pkRealF32: dtFloat32
-  of pkRealFp8: dtFp8
-  of pkRealP8: dtPosit8
 
 func biasType*(p: PolicyKind): DType =
   case p
   of pkAffineI8: dtInt32       ## accumulator units, zero point pre-folded
-  of pkRealF32: dtFloat32
-  of pkRealFp8: dtFp8
-  of pkRealP8: dtPosit8        ## widened into the quire exactly, by `addBias`
-
-func isAffine*(p: PolicyKind): bool = p == pkAffineI8
 
 func hasLutDomain*(p: PolicyKind): bool =
   ## True when the storage type's whole value domain is small enough for the
   ## host to enumerate — that is, 8 bits, 256 entries. Non-linear activations
-  ## are lookup tables for exactly these policies and are a host-side error
-  ## for the others; see `steadyc/codec.nim`.
+  ## are lookup tables when this holds and a host-side error when it does not;
+  ## see `steadyc/codec.nim`.
   p.storeType.byteWidth == 1
 
 const MaxSoftmaxClasses* = 4096
@@ -483,10 +472,6 @@ proc validate*(g: var Graph) =
       check op.inputs.len == 1, nm, "expects one input"
       let x = g.tensors[op.inputs[0]]
       let y = g.tensors[op.outputs[0]]
-      check g.policy.isAffine, nm,
-        "softmax needs a uniform integer store domain, so that a " &
-        "max-subtracted difference is itself a table index; only the affine " &
-        "int8 policy qualifies"
       check y.numElements == x.numElements, nm, "must preserve element count"
       check x.shape.len >= 1, nm, "input must have at least one dimension"
       check x.shape == y.shape, nm,

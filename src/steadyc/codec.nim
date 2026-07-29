@@ -12,9 +12,9 @@
 ##     decode: raw storage bits -> float64
 ##     encode: float64          -> raw storage bits
 ##
-## and nothing else. That asymmetry is why a new format does not have to
-## arrive all at once: a SoftPosit binding satisfies this module on a real OS
-## with a real libm, and the target side stays a handful of templates.
+## and nothing else. That asymmetry is worth keeping in mind if a format is
+## ever added: the host side may use libm and float64 freely, and the target
+## side stays a handful of templates that use neither.
 ##
 ## What the codec buys is this module's real product: **non-linear activations
 ## become tables**. For a storage type with 256 values the host can evaluate
@@ -24,12 +24,11 @@
 ## function, rounded once.
 ##
 ## This works for any 8-bit storage type and for no others, which is why
-## `hasLutDomain` gates it and `validate` rejects LUT ops under `RealF32`
-## rather than the kernels quietly reaching for `expf`.
+## `hasLutDomain` gates it and `validate` rejects LUT ops for a policy whose
+## store is wider, rather than the kernels quietly reaching for `expf`.
 
 import std/[math, strformat]
 import ./ir
-import ../steady/[fp8, posit8]
 
 type CodecError* = object of CatchableError
 
@@ -51,14 +50,6 @@ proc decodeStore*(p: PolicyKind, q: Quant, raw: int): float64 =
     let v = int32(cast[int8](uint8(raw)))
     let zero = if q.zeroPoints.len == 0: 0'i32 else: q.zeroPoints[0]
     q.scales[0] * float64(v - zero)
-  of pkRealFp8:
-    float64(Fp8(uint8(raw)).toFloat32)
-  of pkRealP8:
-    Posit8(uint8(raw)).toFloat64
-  of pkRealF32:
-    raise newException(CodecError,
-      "RealF32 has no enumerable storage domain; there is nothing to decode " &
-      "byte-wise and no lookup table to build")
 
 proc encodeStore*(p: PolicyKind, q: Quant, v: float64): int =
   ## The storage byte that best represents `v`. Saturating, never wrapping —
@@ -74,17 +65,6 @@ proc encodeStore*(p: PolicyKind, q: Quant, v: float64): int =
     if qv < -128: qv = -128
     if qv > 127: qv = 127
     int(cast[uint8](int8(qv)))
-  of pkRealFp8:
-    if v != v: return int(Fp8Nan.bits)
-    int(toFp8(float32(v)).bits)
-  of pkRealP8:
-    # NaN maps to NaR, which is how a table activation keeps an
-    # unrepresentable input unrepresentable instead of inventing a value.
-    if v != v: return int(Posit8NaR.bits)
-    int(toPosit8(v).bits)
-  of pkRealF32:
-    raise newException(CodecError,
-      "RealF32 values are emitted as literals; there is no byte encoding step")
 
 proc quantizedValue*(p: PolicyKind, q: Quant, v: float64): int32 =
   ## The *numeric* quantized value of `v`, as opposed to its storage byte.
@@ -92,8 +72,6 @@ proc quantizedValue*(p: PolicyKind, q: Quant, v: float64): int32 =
   ## what pad values and clamp bounds are expressed in.
   case p
   of pkAffineI8: int32(cast[int8](uint8(encodeStore(p, q, v))))
-  else: raise newException(CodecError,
-    &"quantizedValue is meaningful only for an integer-affine policy, not {p}")
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ACTIVATION TABLES

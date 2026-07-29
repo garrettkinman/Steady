@@ -465,7 +465,12 @@ proc choosePolicy(r: Reader, keep: seq[bool]): PolicyKind =
       "the graph mixes int8 and float32 activations; one graph is compiled " &
       "under one numeric policy")
   if sawInt8: return pkAffineI8
-  if sawFloat: return pkRealF32
+  if sawFloat:
+    raise newException(TfliteError,
+      "this model has float32 activations; only int8-quantized models are " &
+      "supported. Convert it with TFLite's full-integer post-training " &
+      "quantization and a representative dataset, so that the file carries " &
+      "the scales and zero points this compiler resolves at build time")
   raise newException(TfliteError, "the graph has no activations to compile")
 
 proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =

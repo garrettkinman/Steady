@@ -159,8 +159,3 @@ suite "activation ranges":
   test "no fused activation spans the full int8 range":
     let q = Quant(scales: @[0.05], zeroPoints: @[3'i32], axis: -1)
     check affineActRange(faNone, q) == (-128'i32, 127'i32)
-
-  test "real policies get plain bounds with no quantization involved":
-    check realActRange(faRelu) == (0'f32, Inf.float32)
-    check realActRange(faRelu6) == (0'f32, 6'f32)
-    check realActRange(faReluN1To1) == (-1'f32, 1'f32)

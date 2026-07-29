@@ -13,10 +13,8 @@
 ## is what lets the device-side code be as small as it is.
 
 import steadyc/[ir, quant, codec, arena, backend, emit, capi, sim, tflite]
-import steady/posit8
 
 export ir, quant, codec, arena, backend, emit, capi, sim, tflite
-export posit8   ## `simulatePosit` speaks in `Posit8`, so a caller needs the type
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # COMMAND-LINE DRIVER
