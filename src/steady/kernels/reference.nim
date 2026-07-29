@@ -81,8 +81,8 @@ macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
 # What is *not* done here is splitting one output's reduction into partial sums
 # and adding them at the end. That is the other standard way to break a
 # dependency chain, and it re-associates the addition — exact for a wrapping
-# integer accumulator, not exact for float32 or fp8, and not exact for a posit
-# quire's rounding either. Every transform below leaves each individual
+# integer accumulator and not exact in general, which would make a kernel's
+# results depend on its blocking. Every transform below leaves each individual
 # accumulator seeing exactly the taps it saw before, in exactly the order it saw
 # them, so bit-exactness against TFLite holds by construction rather than by
 # retesting. The differential harness confirms it on the six real models it can
@@ -97,9 +97,9 @@ macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
 # per policy in `contract.nim` and overridable by an arithmetic backend. They
 # are not constants of this file because what they trade against is the
 # target's register file and how many accumulators of `Accum(P)` fit in it —
-# four is right for a core holding int32 or float32, and a posit unit with a
-# single quire register wants one. See the note in `contract.nim` for the
-# measurements behind the default.
+# four is right for a core holding int32, a unit with a single accumulator
+# register wants one, and a vector unit wants more. See the note in
+# `contract.nim` for the measurements behind the default.
 #
 # They are bound to a `const` at the top of each kernel so that the value is a
 # compile-time literal by the time `unrolled` sees it.
@@ -652,8 +652,9 @@ proc softmax*[P, S](
   ## integer store is itself an index in `0 ..< 256`. That is what makes the
   ## table possible: subtracting the max is required for numerical range, and
   ## only a uniform integer domain keeps the subtracted value enumerable. A
-  ## non-uniform format (fp8, posits) has no such index, so this op is affine
-  ## only and the host rejects it elsewhere rather than the kernel branching.
+  ## format whose values are not uniformly spaced has no such index, so this op
+  ## is affine only and the host rejects it elsewhere rather than the kernel
+  ## branching.
   ##
   ## Entry `d` holds `exp(-d * inScale) * 2^expBits`, with `expBits` chosen by
   ## the host from the class count so the sum cannot overflow an int32. The

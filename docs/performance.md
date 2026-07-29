@@ -276,9 +276,11 @@ expressed through `mac` and none of them touching the policy abstraction:
 
 The property that makes this safe is what is *not* done: no output's reduction is ever split into
 partial sums. That is the other standard way to break a dependency chain, and it re-associates the
-addition — exact for a wrapping int32 accumulator, not exact for float32, fp8, or a posit quire's
-rounding. Every accumulator above still sees exactly the taps it saw before, in exactly the order it
-saw them, so bit-exactness holds by construction rather than by retesting. Independent accumulators
+addition — exact for a wrapping int32 accumulator, and not exact in general, so a kernel that
+re-associates is a kernel whose results depend on its blocking. Every accumulator above still sees
+exactly the taps it saw before, in exactly the order it saw them, so bit-exactness holds by
+construction rather than by retesting, and the arithmetic-backend fixture forces the unblocked path
+and demands the same bits as a standing check on that. Independent accumulators
 come from blocking instead, which gives the same instruction-level parallelism for free.
 
 The harness confirms it rather than taking it on trust: across all six comparable models at fifteen
@@ -297,7 +299,7 @@ Block widths are `OcBlock`, `DwBlock` and `FcBlock`, defaulting to four for ever
 than four, and the assembly says why — eight accumulators plus eight weights plus eight activations
 spilled seven of the accumulators to the stack. That number is a property of the register file
 holding `Accum(P)`, which is why it is a policy member rather than a constant of the kernel file: a
-posit unit with a single quire register wants one, and an arithmetic backend overrides it without
+unit with a single accumulator register wants one, and an arithmetic backend overrides it without
 touching a kernel. Three separate constants is deliberate too — the right width for a scalar core
 and for a Helium core are not the same number, and the three kernels want them for different
 reasons.

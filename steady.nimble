@@ -30,11 +30,10 @@ import std/os
 task gen, "Regenerate the example models into tests/generated":
   exec "nim c -r --hints:off --path:src examples/tiny_cnn.nim tests/generated"
   exec "nim c -r --hints:off --path:src examples/branch_net.nim tests/generated"
-  exec "nim c -r --hints:off --path:src examples/posit_net.nim tests/generated"
 
 task test, "Run the full test suite":
   genTask()
-  for f in ["test_fp8", "test_posit8", "test_quant", "test_codec", "test_arena",
+  for f in ["test_quant", "test_codec", "test_arena",
             "test_backend", "test_tflite", "test_dispatch", "test_e2e"]:
     echo "\n=== " & f & " ==="
     exec "nim c -r --hints:off --path:src tests/" & f & ".nim"
@@ -46,8 +45,8 @@ task test, "Run the full test suite":
   # And against the *arithmetic* backend fixture, at the other seam: policy
   # members replaced rather than whole kernels. Its arithmetic is identical to
   # the default and its block widths are 1 instead of 4, so every result must
-  # come out bit-identical — including the end-to-end posit model, which is
-  # checked against a reference that knows nothing about either.
+  # come out bit-identical — including the end-to-end models, which are checked
+  # against a simulator that knows nothing about either.
   echo "\n=== test_dispatch (with arithmetic backend) ==="
   exec "nim c -r --hints:off -d:steadyArith --path:src --path:tests/fixtures " &
        "--nimcache:build/dispatch_ar tests/test_dispatch.nim"

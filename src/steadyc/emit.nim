@@ -24,7 +24,6 @@
 
 import std/[strformat, strutils, tables, times, os, math]
 import ./ir, ./quant, ./arena, ./codec, ./backend
-import ../steady/posit8
 
 const ToolVersion* = "0.1.0"
 
@@ -106,10 +105,6 @@ proc emitArrayBody(s: var string, dtype: DType, count: int, data: seq[byte]) =
     for i in 0 ..< count:
       if i mod PerLine == 0: s.add "\n  "
       s.add $cast[int8](data[i]) & ","
-  of dtFp8, dtPosit8:
-    for i in 0 ..< count:
-      if i mod PerLine == 0: s.add "\n  "
-      s.add "0x" & toHex(data[i], 2) & "u,"
   of dtInt32:
     for i in 0 ..< count:
       if i mod 8 == 0: s.add "\n  "
@@ -192,81 +187,36 @@ extern "C" {{
 
 proc paramsExpr(g: Graph, rp: ResolvedParams, multSym, shiftSym: string,
                 perChannel: bool): string =
-  if rp.affine:
-    let stride = if perChannel: 1 else: 0
-    &"AffineParams(mult: cast[ptr UncheckedArray[int32]](addr {multSym}), " &
-    &"shift: cast[ptr UncheckedArray[int32]](addr {shiftSym}), " &
-    &"channelStride: {stride}, outZeroPoint: {rp.outZeroPoint}'i32, " &
-    &"actMin: {rp.qActMin}'i32, actMax: {rp.qActMax}'i32)"
-  elif g.policy == pkRealP8:
-    # Quire domain: fixed point in units of 2^-QuireScale, so an activation
-    # bound becomes an integer and the clamp happens before the single
-    # rounding rather than after it. Every bound this can produce — 0, 1, 6 —
-    # is exact on that grid. A fixed-point accumulator has no infinity, so an
-    # absent bound is the end of the type.
-    let lo = if rp.fActMin == NegInf.float32: "low(Quire)"
-             else: &"{int64(round(float64(rp.fActMin) * float64(QuireOne)))}'i64"
-    let hi = if rp.fActMax == Inf.float32: "high(Quire)"
-             else: &"{int64(round(float64(rp.fActMax) * float64(QuireOne)))}'i64"
-    &"RealParams[Quire](actMin: {lo}, actMax: {hi})"
-  else:
-    let lo = if rp.fActMin == NegInf.float32: "-Inf.float32" else: &"{rp.fActMin}'f32"
-    let hi = if rp.fActMax == Inf.float32: "Inf.float32" else: &"{rp.fActMax}'f32"
-    &"RealParams[float32](actMin: {lo}, actMax: {hi})"
-
-proc positLiteral(v: float64): string =
-  ## A posit as its encoding, resolved here rather than on the device.
-  ##
-  ## The fp8 arms below spell a conversion the target then performs at
-  ## runtime, once per invoke per constant. There is no reason to: the host
-  ## already owns the codec, and a byte is a byte.
-  &"Posit8(0x{toHex(byte(encodeStore(pkRealP8, Quant(), v)), 2)}'u8)"
+  let stride = if perChannel: 1 else: 0
+  &"AffineParams(mult: cast[ptr UncheckedArray[int32]](addr {multSym}), " &
+  &"shift: cast[ptr UncheckedArray[int32]](addr {shiftSym}), " &
+  &"channelStride: {stride}, outZeroPoint: {rp.outZeroPoint}'i32, " &
+  &"actMin: {rp.qActMin}'i32, actMax: {rp.qActMax}'i32)"
 
 proc storeLiteral(p: PolicyKind, v: int32): string =
   ## A Store-typed literal for clamp bounds and pad values.
   case p
   of pkAffineI8: &"{v}'i8"
-  of pkRealF32: &"{float32(v)}'f32"
-  of pkRealFp8: &"toFp8({float32(v)}'f32)"
-  of pkRealP8: positLiteral(float64(v))
 
 proc storeLiteralF(p: PolicyKind, q: Quant, v: float64): string =
   ## A Store-typed literal for a *real* value the graph specified — the pad
-  ## constant. For affine that means quantizing it here, on the host, which is
-  ## how PAD's "fill with 0.0" becomes "fill with the zero point" without the
-  ## kernel or the caller ever spelling that out.
+  ## constant. That means quantizing it here, on the host, which is how PAD's
+  ## "fill with 0.0" becomes "fill with the zero point" without the kernel or
+  ## the caller ever spelling that out.
   case p
   of pkAffineI8: &"{quantizedValue(p, q, v)}'i8"
-  of pkRealF32: &"{float32(v)}'f32"
-  of pkRealFp8: &"toFp8({float32(v)}'f32)"
-  of pkRealP8: positLiteral(v)
 
 proc biasLiteral(p: PolicyKind, v: int32): string =
-  ## A Bias-typed literal, in accumulator units. Only ever non-zero for
-  ## affine, where it carries a folded zero-point correction.
+  ## A Bias-typed literal, in accumulator units: it carries a folded
+  ## zero-point correction rather than the model's own bias value.
   case p
   of pkAffineI8: &"{v}'i32"
-  of pkRealF32: &"{float32(v)}'f32"
-  of pkRealFp8: &"toFp8({float32(v)}'f32)"
-  of pkRealP8: positLiteral(float64(v))
 
 proc clampLiteral(p: PolicyKind, fused: FusedAct, outQ: Quant): (string, string) =
   case p
   of pkAffineI8:
     let (lo, hi) = affineActRange(fused, outQ)
     (&"{lo}'i8", &"{hi}'i8")
-  of pkRealF32:
-    let (lo, hi) = realActRange(fused)
-    ((if lo == NegInf.float32: "-Inf.float32" else: &"{lo}'f32"),
-     (if hi == Inf.float32: "Inf.float32" else: &"{hi}'f32"))
-  of pkRealFp8:
-    let (lo, hi) = realActRange(fused)
-    ((if lo == NegInf.float32: "Fp8Min" else: &"toFp8({lo}'f32)"),
-     (if hi == Inf.float32: "Fp8Max" else: &"toFp8({hi}'f32)"))
-  of pkRealP8:
-    let (lo, hi) = realActRange(fused)
-    ((if lo == NegInf.float32: "Posit8Min" else: positLiteral(float64(lo))),
-     (if hi == Inf.float32: "Posit8Max" else: positLiteral(float64(hi))))
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # MAIN EMITTER
@@ -463,12 +413,10 @@ const
         else: wT.shape[3]
       let rp = resolveMatmulParams(g, g.tensors[x], wT, g.tensors[y],
                                    op.fused, outC)
-      var multSym, shiftSym: string
-      if rp.affine:
-        multSym = emitConst(cSym(g, &"m{oi}_", op.name),
-          tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
-        shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
-          tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
+      let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
+        tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
+      let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
+        tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
       let prm = paramsExpr(g, rp, multSym, shiftSym, wT.quant.isPerChannel)
       let pv = storeLiteral(g.policy, padValueFor(g, g.tensors[x]))
 
@@ -512,12 +460,10 @@ const
       let b = op.inputs[1]
       let (rp, rescale) = resolveAddParams(g, g.tensors[a], g.tensors[b],
                                            g.tensors[y], op.fused)
-      var multSym, shiftSym: string
-      if rp.affine:
-        multSym = emitConst(cSym(g, &"m{oi}_", op.name),
-          tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
-        shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
-          tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
+      let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
+        tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
+      let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
+        tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
       let prm = paramsExpr(g, rp, multSym, shiftSym, false)
       opCalls.add &"  addElementwise({policy}, {bufExpr(y)}, {bufExpr(a)}, " &
                   &"{bufExpr(b)},\n    {prm}, {g.tensors[y].numElements},\n" &
@@ -563,12 +509,10 @@ const
       if anyRescaled:
         let (rp, rs) = resolveConcatParams(g, ins, g.tensors[y], op.fused)
         rescales = rs
-        var multSym, shiftSym: string
-        if rp.affine:
-          multSym = emitConst(cSym(g, &"m{oi}_", op.name),
-            tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
-          shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
-            tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
+        let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
+          tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
+        let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
+          tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
         prm = paramsExpr(g, rp, multSym, shiftSym, false)
 
       var dstOff = 0
@@ -593,12 +537,10 @@ const
       let count = xs[1] * xs[2]
       let (rp, corr) = resolveMeanParams(g, g.tensors[x], g.tensors[y], count,
                                          op.fused)
-      var multSym, shiftSym: string
-      if rp.affine:
-        multSym = emitConst(cSym(g, &"m{oi}_", op.name),
-          tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
-        shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
-          tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
+      let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
+        tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
+      let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
+        tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
       let prm = paramsExpr(g, rp, multSym, shiftSym, false)
       opCalls.add &"  meanSpatial({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
                   &"{biasLiteral(g.policy, corr)},\n    {prm},\n" &

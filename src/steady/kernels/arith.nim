@@ -11,10 +11,10 @@
 ## answer to different hardware:
 ##
 ##   an NPU or a CMSIS-NN port swallows a layer          -> dispatch.nim
-##   a posit ALU, an fp8 unit, a native-format core      -> here
+##   a fused multiply-accumulate instruction, an ALU      -> here
 ##
-## The distinction matters. A posit arithmetic unit does not accelerate
-## `conv2d`; it accelerates `mac`. Routing through the op-level seam would
+## The distinction matters. A core with a multiply-accumulate instruction does
+## not accelerate `conv2d`; it accelerates `mac`. Routing through the op-level seam would
 ## mean reimplementing seven kernels that differ from the reference only in
 ## which instruction sits in the innermost loop — exactly the forking this
 ## design exists to avoid. Overriding `mac` for one policy instead makes
@@ -31,8 +31,8 @@
 ## the layering acyclic: an arithmetic backend sits below the defaults it
 ## replaces, a kernel backend sits above them. Selection is per-member and
 ## per-policy through `when compiles`, so a backend defining only `mac` for
-## `RealP8` gets exactly that and everything else falls through — no registry,
-## no indirect call, nothing at runtime.
+## `AffineI8` gets exactly that and everything else falls through — no
+## registry, no indirect call, nothing at runtime.
 ##
 ## The default implementations remain compiled and reachable as `policy.mac`
 ## and friends, which is what makes a backend differential-testable against
@@ -109,9 +109,9 @@ template addRescaled*(P: typedesc, acc, v, mult, shift, offset: untyped) =
            policy.addRescaled(P, acc, v, mult, shift, offset))
 
 template lutIndex*(P: typedesc, v: untyped): untyped =
-  ## Only ever instantiated for policies that have one; a 32-bit store has no
-  ## enumerable domain, so `lut1d` simply does not compile for `RealF32` and
-  ## the host rejects the op rather than the kernel branching.
+  ## Only ever instantiated for policies that have one; a store wider than a
+  ## byte has no enumerable domain, so `lut1d` simply does not compile for it
+  ## and the host rejects the op rather than the kernel branching.
   viaArith(steady_arith.lutIndex(P, v), policy.lutIndex(P, v))
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -119,8 +119,9 @@ template lutIndex*(P: typedesc, v: untyped): untyped =
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # Dispatched like any other member, and for the same reason: how many
 # accumulators should be in flight is a fact about the hardware holding them.
-# A backend that overrides `mac` with a single-quire-register instruction
-# almost certainly wants to override these to 1 in the same module.
+# A backend that overrides `mac` with an instruction against a single
+# accumulator register almost certainly wants to override these to 1 in the
+# same module.
 #
 # The result has to be a compile-time constant — the kernels bind it to a
 # `static int` and unroll against it — so an override must be a literal or a

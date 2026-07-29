@@ -7,6 +7,10 @@
 
 # Steady
 
+[![CI](https://github.com/garrettkinman/Steady/actions/workflows/ci.yml/badge.svg)](https://github.com/garrettkinman/Steady/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Nim](https://img.shields.io/badge/nim-%E2%89%A5%202.2.0-f3d400.svg)](https://nim-lang.org)
+
 An ahead-of-time TinyML inference compiler and runtime, in pure Nim, for microcontrollers.
 
 Steady is not an interpreter. A host-side compiler reads a model, plans its memory, resolves its
@@ -15,8 +19,9 @@ the device is the calls, in order, and nothing else — no graph structure, no o
 dispatch table, no allocator.
 
 > **Status: early but real.** `steadyc model.tflite` compiles actual int8 models — MobileNetV1/V2,
-> ResNet-8, DS-CNN, FOMO — and five of the seven reference models in the test suite come out
-> bit-identical to TFLite on every intermediate tensor. See [Roadmap](#roadmap).
+> ResNet-8, DS-CNN, FOMO — and four of the seven reference models in the test suite come out
+> bit-identical to TFLite on every intermediate tensor, with the two divergences attributed to a
+> named operator rather than averaged into a tolerance. See [Verification](#verification).
 
 ## Quick start
 
@@ -118,11 +123,9 @@ emitModel(g, p, "generated", "my_model")
 emitCApi(g, p, "generated", "my_model")   # optional: C header + staticlib shim
 ```
 
-See [examples/tiny_cnn.nim](examples/tiny_cnn.nim) for a complete model,
+See [examples/tiny_cnn.nim](examples/tiny_cnn.nim) for a complete model and
 [examples/branch_net.nim](examples/branch_net.nim) for one that exercises padding, concatenation, a
-spatial mean, a table activation and softmax, and [examples/posit_net.nim](examples/posit_net.nim)
-for the same compiler over a real-number policy — no scales, no zero points, a quire instead of an
-int32 accumulator.
+spatial mean, a table activation and softmax.
 
 ## How it works
 
@@ -147,20 +150,24 @@ is out of scope by construction.
 
 ### Design principles
 
-- **Configurable over the core numeric type.** Kernels are generic over a *numeric policy* that
-  abstracts what happens between accumulate and store. Integer-affine quantization and real-number
-  formats genuinely differ there and nowhere else. Four policies ship: `AffineI8`, `RealF32`,
-  `RealFp8`, and `RealP8` — posit(8,0) over an **exact int64 quire**, so a convolution's whole
-  reduction is the real-valued reduction and rounds once. Adding it changed no kernel source.
+- **Arithmetic is a seam, not a hardcoding.** Kernels are generic over a *numeric policy* that
+  abstracts what happens between accumulate and store, and `mac` is a primitive rather than sugar
+  for `acc += a * b`. One policy ships — `AffineI8`, int8 storage and int32 accumulation — because
+  that is what interchange formats carry. The abstraction is there for what plugs into it: SMLAD on
+  a Cortex-M4, a vector unit's widened accumulate, an accumulator a hardware unit owns. Kernels
+  written around `+=` close that door, and reopening it means rewriting every kernel rather than
+  adding a file.
 - **No dynamic allocation, ever.** Every activation buffer is a compile-time offset into one static
   arena, verified by linking a real Cortex-M4 image and auditing it for allocator symbols.
 - **Zero-overhead execution.** Generated `invoke` is a flat sequence of calls.
 - **Acceleratable without forking, at two heights.** Backends override individual *ops* per policy —
   the seam an NPU or CMSIS-NN wants — or individual *policy members* like `mac` and `finish`, which
-  is the seam a posit or fp8 arithmetic unit wants. Overriding `mac` for one policy speeds up every
-  kernel at once without touching one. Both resolve by compile-time name resolution with automatic
-  fallback, and the block widths dispatch the same way, since how many accumulators belong in flight
-  is a fact about the register file holding them.
+  is the seam an arithmetic unit wants. Overriding `mac` speeds up every kernel at once without
+  touching one. Both resolve by compile-time name resolution with automatic fallback, and the block
+  widths dispatch the same way, since how many accumulators belong in flight is a fact about the
+  register file holding them. The test suite runs the whole end-to-end path with the arithmetic
+  substituted and requires bit-identical results, which is what keeps "the abstraction is free"
+  from being an assertion.
 - **No external dependencies.** Nim's standard library on the host; nothing at all on the target.
 
 [docs/design.md](docs/design.md) covers the numeric policy, quantization and bias folding, table
@@ -172,18 +179,13 @@ Implemented: `Conv2D`, `DepthwiseConv2D`, `FullyConnected`, `MaxPool2D`, `Averag
 `Clamp` (ReLU / ReLU6 / ReLUN1To1), `Reshape` (free — resolved by aliasing), `Pad`, `Concatenation`,
 `Mean` (over H and W, i.e. global average), `Logistic`, `Tanh`, `Softmax`.
 
-Three do not exist under every policy, and the host says so rather than the kernels branching:
-
-| | `AffineI8` | `RealF32` | `RealFp8` | `RealP8` |
-|---|---|---|---|---|
-| everything except the three below | yes | yes | yes | yes |
-| `Logistic`, `Tanh` | yes | — | yes | yes |
-| `Softmax` | yes | — | — | — |
-
-A table activation needs an enumerable storage domain, and softmax needs a uniform one on top of
-that; the op set is therefore a property of the number format rather than a `when` branch in a
-kernel. `Softmax` normalises over the last axis once per row, so one call covers both a classifier's
-single vector and a detector's grid — FOMO's output is 144 independent 3-class distributions.
+`Logistic` and `Tanh` are lookup tables the host builds by evaluating the true function at all 256
+representable inputs, so the device does a load rather than arithmetic — no libm, no software float,
+no fixed-point series expansion. That works because int8 has an enumerable storage domain, and it is
+a host-side check rather than a `when` branch in a kernel: a policy whose store is wider than a byte
+gets a compile-time rejection naming the op. `Softmax` normalises over the last axis once per row, so
+one call covers both a classifier's single vector and a detector's grid — FOMO's output is 144
+independent 3-class distributions.
 
 Other deliberate limits, each a host-side error naming the op rather than a wrong answer: `Pad` is
 spatial only, `Mean` reduces H and W only, `Add` does not broadcast, batch is always 1. The bias is
@@ -196,18 +198,19 @@ Three layers, each answering a question the others cannot.
 **Against a simulator.** The end-to-end test runs generated code and a host simulator over the same
 inputs and requires bit-identical output. The simulator deliberately evaluates the *unfolded* form —
 explicit `x - Zx` at every tap, original biases — so agreement proves the folding transform correct,
-including at SAME-padded edges. The posit model is checked the same way against a reference whose
-deliberate difference is the *accumulator*: it reduces in float64 and rounds with a separately
-derived encoder, so bit-identical output proves the quire exact and the two encoders equal. Requantization arithmetic, activation tables and softmax
-normalisation are shared between runtime and simulator, so they are pinned separately against the
-published gemmlowp definitions and a float64 reference, entry by entry.
+including at SAME-padded edges. The same models are then run again with the *arithmetic* replaced —
+`mac` substituted and the block widths forced to 1 — and required to produce identical bits, which
+is what makes "the numeric seam costs nothing" a test rather than a claim. Requantization arithmetic,
+activation tables and softmax normalisation are shared between runtime and simulator, so they are
+pinned separately against the published gemmlowp definitions and a float64 reference, entry by
+entry.
 
-**Against a linker.** `nimble freestanding` links a real Cortex-M4 image containing all three example
-models and audits it: no allocator symbols, weights and tables in `.rodata`, arena in `.bss`, and —
-for the posit model — no soft-float routines anywhere in the image, which is the fixed-point quire's
-own claim under audit. The placement check matters more than it looks: a module-level `let` lands in
-`.data` and is copied into RAM at startup, which on a part with 64 KB of SRAM and 512 KB of flash is
-exactly backwards.
+**Against a linker.** `nimble freestanding` links a real Cortex-M4 image containing both example
+models and audits it: no allocator symbols, weights and tables in `.rodata`, arena in `.bss`, and no
+soft-float routines anywhere in the image — the host resolved every scale into a multiplier and a
+shift, so a float on the target would mean something was left to runtime that should not have been.
+The placement check matters more than it looks: a module-level `let` lands in `.data` and is copied
+into RAM at startup, which on a part with 64 KB of SRAM and 512 KB of flash is exactly backwards.
 
 **Against TFLite itself.** `nimble models` compiles seven real int8 models with `steadyc` and
 compares every intermediate tensor against TFLite's own **reference** kernels — not the optimized
@@ -356,6 +359,18 @@ what was tried and reverted, and what is left: [docs/performance.md](docs/perfor
 
 ## Building
 
+### Repository layout
+
+| path | what is in it |
+|---|---|
+| [src/steady/](src/steady/) | the target runtime — numeric policy contract, kernels, dispatch |
+| [src/steadyc/](src/steadyc/) | the host compiler — IR, TFLite importer, quantization, arena planner, emitter |
+| [examples/](examples/) | models built through the library API; `nimble gen` regenerates them |
+| [tests/mcu/boards/](tests/mcu/boards/) | one directory per supported board, and nothing part-specific above it |
+| [docs/](docs/) | [design](docs/design.md) and [performance](docs/performance.md) in detail |
+
+### Tasks
+
 ```sh
 nimble test           # full suite, regenerates the example models first
 nimble freestanding   # bare-metal build + link audit (needs arm-none-eabi-gcc)
@@ -429,12 +444,12 @@ failure, but quietly reporting success would be.
 
 Done:
 
-- [x] Numeric policy abstraction, validated across three dtypes
+- [x] Numeric policy abstraction — `mac` as a primitive, so arithmetic is substitutable
 - [x] Reference kernels — policy-generic, destination-passing, runtime shapes
 - [x] Backend override with per-op/per-policy fallback
-- [x] Policy-member dispatch — `mac`, `finish` and the block widths overridable per policy, so an
-      arithmetic unit plugs in without a kernel changing; verified by running the whole suite with
-      substituted arithmetic and requiring bit-identical results
+- [x] Policy-member dispatch — `mac`, `finish` and the block widths overridable, so an arithmetic
+      unit plugs in without a kernel changing; verified by running the whole suite with substituted
+      arithmetic and requiring bit-identical results
 - [x] IR, shape inference, validation
 - [x] Lifetime analysis and arena packing, multi-model
 - [x] Quantization resolution and bias folding
@@ -443,8 +458,6 @@ Done:
 - [x] `--os:any --mm:none` build, linked and audited on Cortex-M4
 - [x] Tier-1 data movement: `Pad`, `Concatenation`, `Mean` (spatial)
 - [x] Host-side numeric codec, LUT activations (`Logistic`, `Tanh`) and int8 `Softmax`
-- [x] `RealP8`: posit(8,0) with an exact int64 quire — no kernel changes, no floating point on the
-      target, verified against a float64 reference on every one of the 256 encodings
 - [x] Host-side backend hook for build-time constant layout, with a layout tag the target can assert
 - [x] `--app:staticlib` packaging with a C header, verified by linking a C consumer against it
 - [x] TFLite importer, with its own flatbuffer reader — no `flatc`, no dependency
@@ -477,6 +490,16 @@ Next, roughly in order:
 - [ ] An ONNX importer, which the IR was shaped to allow and nothing else blocks
 
 Deliberately out of scope: runtime model loading, training, batch sizes above 1.
+
+**Alternative number formats**, too, and that one is worth a sentence because the compiler is
+visibly parameterised over a numeric policy and ships exactly one. Float32, OCP fp8 E4M3 and
+posit(8,0)-over-an-int64-quire were all implemented here and all removed. No interchange format can
+carry them, so none could be driven from a `.tflite`; and the posit one was not the format its name
+claimed, since the 2022 standard fixes es = 2 and a 16n-bit quire — a conforming posit8 needs a
+128-bit accumulator, while the cheap `mac` that made it interesting depended entirely on es = 0.
+The seam they were built on stays, because that is what a CMSIS-NN or SIMD backend plugs into; see
+[src/steady/contract.nim](src/steady/contract.nim). A format with hardware behind it would be
+welcome back, and would want `Accum(P)` made overridable first.
 
 ## License
 

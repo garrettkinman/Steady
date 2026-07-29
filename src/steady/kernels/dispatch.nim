@@ -12,8 +12,9 @@
 ## and produces no indirect calls — there is no registry and no vtable.
 ##
 ## This is the *kernel* seam. The one below it — replacing the arithmetic a
-## kernel is built from, which is what a posit or fp8 arithmetic unit wants —
-## is `kernels/arith.nim`. A backend can use either or both.
+## kernel is built from, which is what an arithmetic unit or a fused
+## multiply-accumulate instruction wants — is `kernels/arith.nim`. A backend
+## can use either or both.
 ##
 ## To supply a backend:
 ##
