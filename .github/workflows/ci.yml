@@ -1,0 +1,63 @@
+# Copyright (c) 2026 Garrett Kinman
+#
+# This software is released under the MIT License.
+# https://opensource.org/licenses/MIT
+#
+# The one job runs `nimble ci`, which is the repository's own definition of
+# what has to hold — unit tests, the bare-metal link audit, the C packaging
+# check, and the differential harness against TFLite. Keeping the workflow a
+# single call rather than a list of steps means CI and a local run cannot drift
+# apart: `nimble ci` is what a contributor runs, and it is what this runs.
+#
+# Two of those steps skip themselves rather than fail when an optional
+# dependency is missing, which is what makes that possible here:
+#
+#   freestanding  needs arm-none-eabi-gcc, installed below so it does run
+#   models        needs the .tflite fixtures and a reference interpreter, and
+#                 skips loudly without them. They are 5 MB of downloads plus
+#                 TensorFlow, so CI does not fetch them; that check is a local
+#                 one, run against `nimble fetch`.
+#
+# Not covered, and not coverable: `nimble mcu`. It needs a board on a USB port,
+# and a cycle count is not a pass or a fail.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: nimble ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jiro4989/setup-nim-action@v2
+        with:
+          nim-version: '2.2.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # For the freestanding check, which links a real Cortex-M4 image and
+      # audits it for allocator symbols and section placement.
+      #
+      # libnewlib is named explicitly and that is not redundant: it is a
+      # *Recommends* of gcc-arm-none-eabi rather than a dependency, so
+      # --no-install-recommends leaves it out — and it is what provides the
+      # nosys.specs and nano.specs the link line asks for. Without it the
+      # compiler installs cleanly and the link fails on a missing specs file.
+      - name: Install the ARM cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi
+
+      - name: Run the suite
+        run: nimble ci -y

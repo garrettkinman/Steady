@@ -7,6 +7,10 @@
 
 # Steady
 
+[![CI](https://github.com/garrettkinman/Steady/actions/workflows/ci.yml/badge.svg)](https://github.com/garrettkinman/Steady/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Nim](https://img.shields.io/badge/nim-%E2%89%A5%202.2.0-f3d400.svg)](https://nim-lang.org)
+
 An ahead-of-time TinyML inference compiler and runtime, in pure Nim, for microcontrollers.
 
 Steady is not an interpreter. A host-side compiler reads a model, plans its memory, resolves its
@@ -15,8 +19,9 @@ the device is the calls, in order, and nothing else — no graph structure, no o
 dispatch table, no allocator.
 
 > **Status: early but real.** `steadyc model.tflite` compiles actual int8 models — MobileNetV1/V2,
-> ResNet-8, DS-CNN, FOMO — and five of the seven reference models in the test suite come out
-> bit-identical to TFLite on every intermediate tensor. See [Roadmap](#roadmap).
+> ResNet-8, DS-CNN, FOMO — and four of the seven reference models in the test suite come out
+> bit-identical to TFLite on every intermediate tensor, with the two divergences attributed to a
+> named operator rather than averaged into a tolerance. See [Verification](#verification).
 
 ## Quick start
 
@@ -353,6 +358,18 @@ Full methodology, the per-operator profile, the four kernel transforms and why t
 what was tried and reverted, and what is left: [docs/performance.md](docs/performance.md).
 
 ## Building
+
+### Repository layout
+
+| path | what is in it |
+|---|---|
+| [src/steady/](src/steady/) | the target runtime — numeric policy contract, kernels, dispatch |
+| [src/steadyc/](src/steadyc/) | the host compiler — IR, TFLite importer, quantization, arena planner, emitter |
+| [examples/](examples/) | models built through the library API; `nimble gen` regenerates them |
+| [tests/mcu/boards/](tests/mcu/boards/) | one directory per supported board, and nothing part-specific above it |
+| [docs/](docs/) | [design](docs/design.md) and [performance](docs/performance.md) in detail |
+
+### Tasks
 
 ```sh
 nimble test           # full suite, regenerates the example models first
