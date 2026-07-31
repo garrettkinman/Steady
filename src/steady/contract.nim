@@ -138,6 +138,30 @@ template Params*(_: typedesc[AffineI8]): typedesc = AffineParams
 ## live at once the compiler spilled seven of the eight to the stack and the
 ## reuse did not pay for the traffic.
 ##
+## That measurement is a Cortex-M4's, with its flash accelerators on, and it
+## does not generalise — which is the case for these being dispatched rather
+## than fixed, and is now a result rather than an argument. Measured on the
+## four convolutional models in the benchmark suite, `OcBlock = 8` against the
+## default 4:
+##
+##   ESP32-C3 (RV32IMC, 32 registers)         1.01x - 1.13x *faster*
+##   STM32L475, flash accelerators on          0.93x - 0.99x, i.e. slower
+##   STM32L475, accelerators off               1.05x - 1.10x faster
+##
+## Three answers from two parts. RISC-V has 32 general-purpose registers where
+## ARM32 has about 13, so the spill that made eight a loss on the M4 does not
+## happen there. And the same M4 flips sign when its flash accelerators are
+## switched off: with nothing in front of flash the kernel is memory-bound, so
+## a wider block pays for its spills by reading the activation patch fewer
+## times. The right width is a property of the core *and* of what sits between
+## it and its weights, and there is no single value that is correct.
+##
+## Four stays the default because it is right for the Cortex-M4 in the
+## configuration a product would ship. A target that wants another value
+## defines `OcBlock(P)` in a `steady_arith` module; the benchmark harness
+## deliberately does not, so that its published tables stay comparable across
+## boards.
+##
 ## They are three numbers rather than one because the kernels want them for
 ## different reasons, and because a machine with a vector unit will not want
 ## the same number in all three places.

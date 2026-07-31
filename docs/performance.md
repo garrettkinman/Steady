@@ -304,6 +304,17 @@ touching a kernel. Three separate constants is deliberate too — the right widt
 and for a Helium core are not the same number, and the three kernels want them for different
 reasons.
 
+That last claim used to be an argument. It is now a measurement, and a sharper one than expected:
+against the default of four, `OcBlock = 8` is **1.01–1.13x faster on the ESP32-C3**, **0.93–0.99x on
+the STM32L475 with its flash accelerators on**, and **1.05–1.10x faster on that same STM32 with them
+off** — three answers from two parts, over the four convolutional models. RISC-V has 32
+general-purpose registers against ARM32's ~13, so the spill that made eight a loss never happens
+there; and the M4 itself changes sign when nothing is left in front of flash, because a memory-bound
+kernel pays for its spills by reading the activation patch fewer times. The right width is a property
+of the core *and* of what sits between it and its weights. Four stays the default because it is right
+for a Cortex-M4 in the configuration a product would ship, and the harness deliberately does not
+override it per board, so that the tables above stay comparable.
+
 ## What did not work
 
 **Pixel tiling in the pointwise path.** Blocking two adjacent output pixels against four filters
