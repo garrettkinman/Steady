@@ -169,6 +169,33 @@ proc conv2d*[P, S, B, PT](
   ## Output channels are computed `ocBlockOf(P)` at a time, so one pass over an
   ## input patch feeds four filters rather than being repeated for each.
   ##
+  ## **A block of filters is the outer loop and the output pixels are the inner
+  ## one**, which is the reverse of the obvious nest. Walking the image and
+  ## sweeping every filter at each pixel has the property that the *entire*
+  ## filter tensor is traversed once per output pixel — for a late pointwise
+  ## layer, a few hundred KB re-read for each of nine pixels. On every part
+  ## this compiler targets the weights are in flash and the activations are in
+  ## SRAM, so that nest streams the slow operand and keeps the fast one
+  ## resident, which is backwards. Interchanging makes one block of filters the
+  ## resident operand — `Blk * kH * kW * inC` bytes, a few KB — small enough to
+  ## stay in whatever sits in front of flash while the whole image sweeps past
+  ## it, and the activations it re-reads instead are the ones that were already
+  ## cheap.
+  ##
+  ## Total reads are identical either way: every (pixel, filter, tap) triple
+  ## needs its weight exactly once, and interchange cannot change that. So on a
+  ## part with nothing in front of flash this is neither better nor worse, and
+  ## it pays exactly to the extent that the target retains anything between
+  ## iterations. That is the property worth having in a portable kernel — an
+  ## upside that scales with the memory system and a downside that does not
+  ## exist.
+  ##
+  ## Bit-exactness is not at risk here, and not because it was retested: the
+  ## interchange reorders *independent outputs*, and each accumulator still
+  ## sees exactly the taps it saw before in the same ky-then-kx-then-ic order.
+  ## Unlike the blocking above, this transform does not even need the
+  ## accumulator's addition to be associative.
+  ##
   ## A stride-1-or-more 1x1 convolution with no padding gets its own path.
   ## That is not a micro-optimization on this class of model: in a
   ## MobileNet-class network the overwhelming majority of multiplies are in
@@ -190,14 +217,19 @@ proc conv2d*[P, S, B, PT](
 
   let filterSize = kH * kW * inC
 
-  template filters(Blk: static int, oc: int, pointwise: static bool) =
+  template filters(Blk: static int,
+                   oc, inYOrigin, inXOrigin, xBase, yBase: untyped,
+                   pointwise: static bool) =
     ## `Blk` filters over one output pixel. Each accumulator sees the same taps
     ## in the same order as the unblocked kernel: ky, then kx, then ic.
+    ##
+    ## The pixel's coordinates arrive as parameters rather than being picked up
+    ## from the enclosing scope, because the loop that supplies them is now a
+    ## template too and its locals are gensym'd.
     var acc: array[Blk, Accum(P)]
     unrolled k, Blk: acc[k] = zeroAccum(P)
 
     when pointwise:
-      let xBase = (inYOrigin * inW + inXOrigin) * inC
       for ic in 0 ..< inC:
         let v = x[xBase + ic]
         unrolled k, Blk:
@@ -224,28 +256,51 @@ proc conv2d*[P, S, B, PT](
       addBias(P, acc[k], bias[oc + k])
       y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
 
+  template overPixels(Blk: static int, oc: int, pointwise: static bool) =
+    ## One block of `Blk` filters, swept across every output pixel.
+    ##
+    ## Every per-pixel address walks rather than being re-derived from `oy` and
+    ## `ox`. That is not tidiness: under the old nest those expressions were
+    ## evaluated once per pixel and shared by all `outC div Blk` filter blocks,
+    ## and interchanging would otherwise have multiplied them by that factor.
+    ## On a layer whose reduction is only a few dozen taps the difference is a
+    ## measurable share of the work rather than bookkeeping.
+    ##
+    ## `xBase` is the pointwise path's input offset; the general path derives
+    ## its own per-tap addresses from `inYOrigin` and `inXOrigin`, because it
+    ## has bounds tests to do anyway.
+    let xColStep = strideW * inC
+    let xRowStep = strideH * inW * inC
+    var yBase = 0
+    var xRow = -padTop * inW * inC
+    for oy in 0 ..< outH:
+      let inYOrigin = oy * strideH - padTop
+      var inXOrigin = -padLeft
+      var xBase = xRow - padLeft * inC
+      for ox in 0 ..< outW:
+        filters(Blk, oc, inYOrigin, inXOrigin, xBase, yBase, pointwise)
+        inXOrigin += strideW
+        xBase += xColStep
+        yBase += outC
+      xRow += xRowStep
+
   let pointwise = kH == 1 and kW == 1 and padTop == 0 and padLeft == 0
 
-  for oy in 0 ..< outH:
-    let inYOrigin = oy * strideH - padTop
-    for ox in 0 ..< outW:
-      let inXOrigin = ox * strideW - padLeft
-      let yBase = (oy * outW + ox) * outC
-      var oc = 0
-      if pointwise:
-        while oc + Oc <= outC:
-          filters(Oc, oc, true)
-          oc += Oc
-        while oc < outC:
-          filters(1, oc, true)
-          inc oc
-      else:
-        while oc + Oc <= outC:
-          filters(Oc, oc, false)
-          oc += Oc
-        while oc < outC:
-          filters(1, oc, false)
-          inc oc
+  var oc = 0
+  if pointwise:
+    while oc + Oc <= outC:
+      overPixels(Oc, oc, true)
+      oc += Oc
+    while oc < outC:
+      overPixels(1, oc, true)
+      inc oc
+  else:
+    while oc + Oc <= outC:
+      overPixels(Oc, oc, false)
+      oc += Oc
+    while oc < outC:
+      overPixels(1, oc, false)
+      inc oc
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # DEPTHWISE CONV2D  (NHWC activations, 1HWC filters)
@@ -296,46 +351,115 @@ proc depthwiseConv2d*[P, S, B, PT](
 
   let outC = inC * depthMultiplier
 
-  template channels(Blk: static int, oc: int) =
+  # Tap-to-tap strides, so the addresses can be walked rather than re-derived.
+  #
+  # This one is worth **nothing**, and is kept only because it costs nothing
+  # either. The obvious kernel writes five multiplies per tap — one for `ix`,
+  # two for the weight base, two for the input base — against `Blk` multiply-
+  # accumulates of real work, which looks like the reason this operator is the
+  # most expensive per MAC in the suite. It is not: measured on its own against
+  # the version that re-derives them, walking the addresses is 0.99x - 1.00x.
+  # GCC strength-reduces those index expressions already, so the multiplies
+  # were never being issued. The entire gain here belongs to the interior split
+  # below. Kept because the walked form is a few bytes smaller and because the
+  # branch-free path wants the pointers in this shape anyway — but the comment
+  # that used to claim credit for it was wrong, and a plausible story about
+  # instruction counts is exactly the kind of thing this project is supposed to
+  # measure rather than tell.
+  let xTapStep = dilationW * inC
+  let xRowStep = dilationH * inW * inC
+
+  template channels(Blk: static int, oc, inYOrigin, inXOrigin, yBase: untyped,
+                    allInside: static bool) =
     ## `Blk` channels over one output pixel, each accumulator seeing its taps
     ## in the original ky-then-kx order.
+    ##
+    ## `allInside` says every tap of this window is within the image, which the
+    ## caller has already decided for the pixel as a whole. That is the entire
+    ## interior — for a SAME-padded 3x3 over 56x56 it is 93% of the pixels — and
+    ## the fast path drops the two comparisons and the branch that the border
+    ## needs. Both paths visit the same taps in the same order and accumulate
+    ## the same products, so the split is invisible in the results.
+    ##
+    ## This is where the whole improvement lives: 1.07x - 1.14x on the operator
+    ## measured on an ESP32-C3, against 1.00x for the address walking it ships
+    ## alongside. Depthwise has no channel reduction, so a tap is two loads and
+    ## one multiply-accumulate and there is nothing for a branch to hide behind;
+    ## deleting the branch is most of what can be done to it without changing
+    ## how the activations are laid out.
+    ##
+    ## It costs 616 bytes of code for the second instantiation, which on a part
+    ## whose instruction and data caches are the same 16 KB is not free either.
     var acc: array[Blk, Accum(P)]
     unrolled k, Blk: acc[k] = zeroAccum(P)
     let ic0 = oc div depthMultiplier      # == oc whenever Blk > 1
 
-    for ky in 0 ..< kH:
-      let iy = inYOrigin + ky * dilationH
-      let rowInside = iy >= 0 and iy < inH
-      for kx in 0 ..< kW:
-        let ix = inXOrigin + kx * dilationW
-        let wBase = (ky * kW + kx) * outC + oc
-        if rowInside and ix >= 0 and ix < inW:
-          let xBase = (iy * inW + ix) * inC + ic0
+    # (ky * kW + kx) is a flat tap counter, so one `outC` step per tap walks
+    # the filter correctly across the row boundary as well as along it.
+    var wBase = oc
+
+    when allInside:
+      var xRow = (inYOrigin * inW + inXOrigin) * inC + ic0
+      for ky in 0 ..< kH:
+        var xBase = xRow
+        for kx in 0 ..< kW:
           unrolled k, Blk:
             mac(P, acc[k], w[wBase + k], x[xBase + k])
-        else:
-          unrolled k, Blk:
-            mac(P, acc[k], w[wBase + k], padValue)
+          wBase += outC
+          xBase += xTapStep
+        xRow += xRowStep
+    else:
+      for ky in 0 ..< kH:
+        let iy = inYOrigin + ky * dilationH
+        let rowInside = iy >= 0 and iy < inH
+        var ix = inXOrigin
+        # Only ever indexed under the bounds test below, so a base derived
+        # from an out-of-range `iy` is arithmetic that is never dereferenced.
+        var xBase = (iy * inW + inXOrigin) * inC + ic0
+        for kx in 0 ..< kW:
+          if rowInside and ix >= 0 and ix < inW:
+            unrolled k, Blk:
+              mac(P, acc[k], w[wBase + k], x[xBase + k])
+          else:
+            unrolled k, Blk:
+              mac(P, acc[k], w[wBase + k], padValue)
+          wBase += outC
+          xBase += xTapStep
+          ix += dilationW
 
     unrolled k, Blk:
       addBias(P, acc[k], bias[oc + k])
       y[yBase + oc + k] = finish(P, acc[k], prm, oc + k)
 
-  let blocked = depthMultiplier == 1
+  template overChannels(inYOrigin, inXOrigin, yBase: untyped,
+                        allInside: static bool) =
+    var oc = 0
+    if blocked:
+      while oc + Dw <= outC:
+        channels(Dw, oc, inYOrigin, inXOrigin, yBase, allInside)
+        oc += Dw
+    while oc < outC:
+      channels(1, oc, inYOrigin, inXOrigin, yBase, allInside)
+      inc oc
 
+  let blocked = depthMultiplier == 1
+  # A window is wholly inside exactly when its first and last taps are, on both
+  # axes — one test per pixel in place of two per tap.
+  let lastY = (kH - 1) * dilationH
+  let lastX = (kW - 1) * dilationW
+
+  var yBase = 0
   for oy in 0 ..< outH:
     let inYOrigin = oy * strideH - padTop
+    let rowsInside = inYOrigin >= 0 and inYOrigin + lastY < inH
+    var inXOrigin = -padLeft
     for ox in 0 ..< outW:
-      let inXOrigin = ox * strideW - padLeft
-      let yBase = (oy * outW + ox) * outC
-      var oc = 0
-      if blocked:
-        while oc + Dw <= outC:
-          channels(Dw, oc)
-          oc += Dw
-      while oc < outC:
-        channels(1, oc)
-        inc oc
+      if rowsInside and inXOrigin >= 0 and inXOrigin + lastX < inW:
+        overChannels(inYOrigin, inXOrigin, yBase, true)
+      else:
+        overChannels(inYOrigin, inXOrigin, yBase, false)
+      inXOrigin += strideW
+      yBase += outC
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # POOLING

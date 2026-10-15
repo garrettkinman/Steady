@@ -145,30 +145,39 @@ in flash. Shape errors are host-side messages that name the op, not generic inst
 There is no interpreter because there is nothing left for one to do.
 
 The cost is that you cannot load a model the binary was not built against. Multiple models in one
-binary are fine — they share one arena sized to the worst case — but over-the-air model replacement
-is out of scope by construction.
+binary are fine — the planner sizes a single arena for the worst case across all of them, though each
+generated module still declares its own array, so sharing one is a roadmap item rather than a fact
+today. Over-the-air model replacement is out of scope by construction.
 
 ### Design principles
 
 - **Arithmetic is a seam, not a hardcoding.** Kernels are generic over a *numeric policy* that
   abstracts what happens between accumulate and store, and `mac` is a primitive rather than sugar
   for `acc += a * b`. One policy ships — `AffineI8`, int8 storage and int32 accumulation — because
-  that is what interchange formats carry. The abstraction is there for what plugs into it: SMLAD on
-  a Cortex-M4, a vector unit's widened accumulate, an accumulator a hardware unit owns. Kernels
+  that is what interchange formats carry. The abstraction is there for what plugs into it: an
+  accumulator a hardware unit owns, a core whose multiply-accumulate is one instruction. Kernels
   written around `+=` close that door, and reopening it means rewriting every kernel rather than
-  adding a file.
+  adding a file. Note the limit, since it is easy to overclaim: a paired-MAC instruction like
+  `SMLAD` is *not* reachable from this seam, because it needs the loads restructured rather than
+  the multiply replaced, and a scalar `mac` never sees more than one tap.
 - **No dynamic allocation, ever.** Every activation buffer is a compile-time offset into one static
   arena, verified by linking a real Cortex-M4 image and auditing it for allocator symbols.
 - **Zero-overhead execution.** Generated `invoke` is a flat sequence of calls.
 - **Acceleratable without forking, at two heights.** Backends override individual *ops* per policy —
-  the seam an NPU or CMSIS-NN wants — or individual *policy members* like `mac` and `finish`, which
-  is the seam an arithmetic unit wants. Overriding `mac` speeds up every kernel at once without
+  the seam a whole-layer accelerator wants — or individual *policy members* like `mac` and `finish`,
+  which is the seam an arithmetic unit wants. Overriding `mac` speeds up every kernel at once without
   touching one. Both resolve by compile-time name resolution with automatic fallback, and the block
   widths dispatch the same way, since how many accumulators belong in flight is a fact about the
   register file holding them. The test suite runs the whole end-to-end path with the arithmetic
   substituted and requires bit-identical results, which is what keeps "the abstraction is free"
-  from being an assertion.
-- **No external dependencies.** Nim's standard library on the host; nothing at all on the target.
+  from being an assertion. That the block widths needed to be a *policy member* rather than a
+  constant is now a measurement rather than an argument: the best value differs between a Cortex-M4
+  and a RISC-V core, and differs again on the same Cortex-M4 with its flash accelerators disabled.
+- **No external dependencies, on the target most of all.** Nim's standard library on the host;
+  nothing at all on the device. A vendor kernel library would be ARM-only, and the result this
+  project has that is hardest to get — one set of kernels, three parts, two instruction sets,
+  identical output bit for bit — is exactly what a per-vendor fast path would dismantle. Backends
+  can still supply one out of tree; the seam is there and it stays.
 
 [docs/design.md](docs/design.md) covers the numeric policy, quantization and bias folding, table
 activations, the TFLite importer, and the backend hooks in detail.
@@ -475,21 +484,53 @@ Done:
       costs it 2x
 - [x] The portable kernel work that benchmark justified: up to 2.2x on a Cortex-M4, with the
       bit-exactness unchanged, digit for digit
+- [x] Memory-hierarchy work in the kernels, aimed at the part that needed it. Convolution walks a
+      block of filters across the whole image rather than the whole filter tensor across each pixel,
+      which puts the flash-resident operand in the reuse position: **1.30x on the RISC-V part** and
+      a few percent on both Cortex-M4s. It cannot cost anything on a part that retains nothing
+      between iterations, because interchange does not change how many reads there are — only which
+      operand is the one being reused. Depthwise decides once
+      per pixel whether its window is wholly inside the image instead of testing every tap, worth
+      1.07x - 1.14x on that operator. Both bit-exact by construction rather than by retesting
 
 Next, roughly in order:
 
-- [ ] **A real CMSIS-NN backend**, target kernels and host layout together. Both hooks it needs now
-      exist, and this is where the large remaining factors are: SMLAD and Helium, not better loop
-      nests.
-- [ ] `Lanes(P)` for SIMD: a widened `mac` over lane vectors with scalar policies as the degenerate
-      case, so the kernels stay one source. Wants blocked activation layouts alongside it, which the
-      host layout hook does not yet reach.
-- [ ] Wider `Pad` (channel padding), `Mean` over other axes, broadcasting `Add`
+- [ ] **Operator coverage, chosen to unlock model families rather than to lengthen a list.** SiLU as
+      a fused lookup table — the host can collapse `Logistic` followed by an elementwise `Mul` on
+      the same operand into one 256-entry table, so a modern activation costs a load. Channel
+      `Split`, nearest-neighbour `Resize`. Then wider `Pad` (channel padding), `Mean` over other
+      axes, broadcasting `Add`
+- [ ] **More models through the differential harness**, cheapest first: EfficientNet-lite0, which
+      has no swish and no squeeze-excite and may compile unmodified today; MobileNetV3-small, which
+      forces a second table activation and a broadcasting multiply; and YOLOv8n's backbone and neck,
+      stopping at the raw grid the way FOMO already does. Box decoding stays the caller's job — it
+      is anchor arithmetic, not inference, and no deployment puts it on the device
+- [ ] **A rejection corpus.** The importer has some thirty distinct refusals and the promise they
+      encode — that an unsupported model is an error naming the operator, never a wrong answer — is
+      the one this compiler most needs to be tested rather than asserted. Deliberately malformed and
+      unsupported fixtures, each pinned to its exact message
+- [ ] **A property test over the arena planner**: random lifetime sets, no two simultaneously-live
+      buffers overlapping, peak matching the reported number. "Every address resolved at compile
+      time" is currently witnessed by examples rather than by an invariant
 - [ ] One shared arena across models emitted separately — the planner already sizes for it, but each
       generated module still declares its own array
+- [ ] Resolve `person_detect`, the one row in the differential table checked against nothing
+- [ ] **1.0: freeze what callers depend on.** The library API, the C ABI, the generated module's
+      contract, the CLI — with a stated semver policy, a changelog, and a versioned operator table
+      giving each operator's exact constraints. The *backend seam* is explicitly excluded and stays
+      provisional, because it has never met a vendor kernel with an opinion about weight layout and
+      freezing it now would be freezing a guess
 - [ ] An ONNX importer, which the IR was shaped to allow and nothing else blocks
 
-Deliberately out of scope: runtime model loading, training, batch sizes above 1.
+Further out, and deliberately not attempted until there is silicon here to measure against: a
+grouped multiply-accumulate primitive over a run of taps, which is the shape both a paired-MAC
+instruction and a vector unit want, and the blocked activation layouts it would need alongside it.
+The seam is designed to accept one; what is missing is the hardware to prove it on, and a primitive
+shaped around a guess is worse than none — a fixed lane count, in particular, would bake in a
+vector width that a variable-length vector machine does not have.
+
+Deliberately out of scope: runtime model loading, training, batch sizes above 1, and any dependency
+the target has to link against.
 
 **Alternative number formats**, too, and that one is worth a sentence because the compiler is
 visibly parameterised over a numeric policy and ships exactly one. Float32, OCP fp8 E4M3 and
@@ -497,7 +538,8 @@ posit(8,0)-over-an-int64-quire were all implemented here and all removed. No int
 carry them, so none could be driven from a `.tflite`; and the posit one was not the format its name
 claimed, since the 2022 standard fixes es = 2 and a 16n-bit quire — a conforming posit8 needs a
 128-bit accumulator, while the cheap `mac` that made it interesting depended entirely on es = 0.
-The seam they were built on stays, because that is what a CMSIS-NN or SIMD backend plugs into; see
+The seam they were built on stays, because it is what any arithmetic backend plugs into and it is
+what keeps `mac` from decaying into a spelling of `+=`; see
 [src/steady/contract.nim](src/steady/contract.nim). A format with hardware behind it would be
 welcome back, and would want `Accum(P)` made overridable first.
 
