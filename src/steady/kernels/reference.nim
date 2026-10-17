@@ -28,6 +28,10 @@
 import std/macros
 import ./arith
 
+# Inner loops, without Nim's checks on a bare-metal target. The host tests
+# run them with the checks on, against the reference results.
+when hostOS == "any": {.push checks: off.}
+
 export arith
 
 macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
@@ -813,3 +817,5 @@ proc softmax*[P, S](
       if q < actMin: q = actMin
       if q > actMax: q = actMax
       y[base + i] = S(q)
+
+when hostOS == "any": {.pop.}

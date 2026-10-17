@@ -51,6 +51,10 @@
 ## deliberately not attempted until there is silicon to measure against.
 
 import ../contract
+
+# Inner loops, without Nim's checks on a bare-metal target. The host tests
+# run them with the checks on, against the reference results.
+when hostOS == "any": {.push checks: off.}
 from ../policy import nil
 
 export contract
@@ -135,3 +139,5 @@ template dwBlockOf*(P: typedesc): int =
 
 template fcBlockOf*(P: typedesc): int =
   viaArith(steady_arith.FcBlock(P), contract.FcBlock(P))
+
+when hostOS == "any": {.pop.}
