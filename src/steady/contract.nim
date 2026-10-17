@@ -96,6 +96,10 @@
 ## that would fix it, and it is not a large one; it has not been made because
 ## there is no hardware here to test it against.
 
+# Inner-loop arithmetic, without Nim's checks on a bare-metal target, as the
+# kernels are
+when hostOS == "any": {.push checks: off.}
+
 type
   AffineI8* = object
     ## TFLite-style affine quantization: real = scale * (q - zeroPoint).
@@ -229,3 +233,5 @@ func multiplyByQuantizedMultiplier*(x, quantizedMultiplier, shift: int32): int32
   roundingDivideByPOT(
     satRoundDoublingHighMul(x * (1'i32 shl leftShift), quantizedMultiplier),
     rightShift)
+
+when hostOS == "any": {.pop.}
