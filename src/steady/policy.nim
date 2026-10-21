@@ -131,8 +131,6 @@ func finishRescaled*(_: typedesc[AffineI16x8], acc: int32, prm: AffineParams): i
   if v > prm.actMax: v = prm.actMax
   int16(v)
 
-template lowestStore*(_: typedesc[AffineI16x8]): int16 = low(int16)
-
 func addRescaled*(_: typedesc[AffineI16x8], acc: var int32, v: int16,
                   mult, shift, offset: int32) {.inline.} =
   ## As for `AffineI8`, with TFLite's left shift for 16 bits, 15: two

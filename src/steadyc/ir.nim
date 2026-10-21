@@ -141,12 +141,6 @@ func biasType*(p: PolicyKind): DType =
   ## the importer narrows them, refusing one that does not fit.
   dtInt32
 
-func storeRange*(p: PolicyKind): (int32, int32) =
-  case p.storeType
-  of dtInt8: (-128'i32, 127'i32)
-  of dtInt16: (-32768'i32, 32767'i32)
-  else: raise newException(ValueError, &"{p} has no integer store")
-
 func hasLutDomain*(p: PolicyKind): bool =
   ## True when the storage type's whole value domain is small enough for the
   ## host to enumerate — that is, 8 bits, 256 entries. Non-linear activations
