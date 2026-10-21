@@ -169,7 +169,13 @@ proc outputChecksum(): uint32 =
   let outp = model.output0()
   result = 0x811c9dc5'u32
   for i in 0 ..< model.Output0Elems:
-    result = (result xor uint32(cast[uint8](outp[i]))) * 0x01000193'u32
+    when sizeof(outp[i]) == 1:
+      result = (result xor uint32(cast[uint8](outp[i]))) * 0x01000193'u32
+    else:
+      # A 16-bit output's two bytes, low first, as they lie in memory
+      let v = uint32(cast[uint16](outp[i]))
+      result = (result xor (v and 0xFF'u32)) * 0x01000193'u32
+      result = (result xor (v shr 8)) * 0x01000193'u32
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # RUN

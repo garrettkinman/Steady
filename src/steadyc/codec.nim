@@ -50,6 +50,8 @@ proc decodeStore*(p: PolicyKind, q: Quant, raw: int): float64 =
     let v = int32(cast[int8](uint8(raw)))
     let zero = if q.zeroPoints.len == 0: 0'i32 else: q.zeroPoints[0]
     q.scales[0] * float64(v - zero)
+  of pkAffineI16x8:
+    raise newException(CodecError, "a 16-bit store has no byte to decode")
 
 proc encodeStore*(p: PolicyKind, q: Quant, v: float64): int =
   ## The storage byte that best represents `v`. Saturating, never wrapping —
@@ -65,6 +67,8 @@ proc encodeStore*(p: PolicyKind, q: Quant, v: float64): int =
     if qv < -128: qv = -128
     if qv > 127: qv = 127
     int(cast[uint8](int8(qv)))
+  of pkAffineI16x8:
+    raise newException(CodecError, "a 16-bit store has no byte to encode")
 
 proc quantizedValue*(p: PolicyKind, q: Quant, v: float64): int32 =
   ## The *numeric* quantized value of `v`, as opposed to its storage byte.
@@ -72,6 +76,9 @@ proc quantizedValue*(p: PolicyKind, q: Quant, v: float64): int32 =
   ## what pad values and clamp bounds are expressed in.
   case p
   of pkAffineI8: int32(cast[int8](uint8(encodeStore(p, q, v))))
+  of pkAffineI16x8:
+    let zero = if q.zeroPoints.len == 0: 0'i64 else: int64(q.zeroPoints[0])
+    int32(clamp(int64(round(v / q.scales[0])) + zero, -32768'i64, 32767'i64))
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # ACTIVATION TABLES

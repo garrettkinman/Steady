@@ -67,6 +67,11 @@ TRIALS="${STEADY_TRIALS:-5}"
 # division in the kernel first, as this compiler originally did, disagreed on
 # 130 channels instead of 4.
 #
+# tinytts_decoder is the one 16x8 model: int16 activations and int8 weights,
+# TFLite's own integer tanh, LeakyReLU and crops. It is not published; the
+# TinyTTS demo's `export/quantize.py` writes it as `decoder_16x8_f32.tflite`,
+# to be copied here under this name.
+#
 # person_detect is compile-only: modern TFLite refuses to load it, because its
 # 2019 converter wrote quantized_dimension 3 on rank-1 bias tensors. This
 # compiler ignores that field for biases and handles the model correctly, but
@@ -79,6 +84,7 @@ MODELS=(
   "kws|7|depthwise-separable CNN; final FC then softmax"
   "ad|3|10 stacked fully-connected layers, no softmax"
   "person_detect|-1|MobileNetV1 0.25 96x96; rejected by modern TFLite"
+  "tinytts_decoder|0|TinyTTS's decoder for one chunk, int16 activations (16x8): bit-exact"
 )
 
 if ! ls "$DIR"/*.tflite >/dev/null 2>&1; then

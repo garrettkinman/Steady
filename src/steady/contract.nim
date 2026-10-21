@@ -10,10 +10,12 @@
 ## only place two numeric formats genuinely differ once the host compiler has
 ## done its job.
 ##
-## **One policy ships.** `AffineI8` is the format every interchange file can
-## carry and every model in the test suite uses, and a contract with one
-## implementor is a fair thing to be suspicious of — so the reason it is here
-## is worth stating rather than assuming.
+## **Two policies ship.** `AffineI8` is the format every interchange file can
+## carry and every model in the test suite uses. `AffineI16x8` is TFLite's
+## other integer format, int16 activations with int8 weights, which a model
+## producing audio needs: at 8 bits its output is 8-bit sound. A contract with
+## one implementor was a fair thing to be suspicious of, and the reason it is
+## here is worth stating rather than assuming.
 ##
 ## It is not to make adding formats easy. It is that `mac` below is a
 ## *primitive*, and that is the seam hardware arithmetic plugs into: a
@@ -56,14 +58,22 @@
 ## The contract, for a policy `P`:
 ##
 ##   Store(P)      typedesc   stored element type
+##   Weight(P)     typedesc   weight element type (int8 for both policies)
 ##   Accum(P)      typedesc   accumulator type
 ##   Bias(P)       typedesc   bias element type (differs from Store for affine!)
 ##   Params(P)     typedesc   per-op finish metadata
 ##
 ##   zeroAccum(P)                   -> Accum(P)
-##   mac(P, acc: var Accum, a, b: Store)
+##   mac(P, acc: var Accum, w: Weight, x: Store)
 ##   addBias(P, acc: var Accum, b: Bias)
 ##   finish(P, acc: Accum, prm: Params, ch: int) -> Store
+##   finishRescaled(P, acc: Accum, prm: Params) -> Store
+##
+## `finish` ends a matmul-family op and `finishRescaled` an elementwise one,
+## whose operands `addRescaled` has brought to a common domain. They are the
+## same arithmetic for `AffineI8` and not for `AffineI16x8`, where TFLite
+## requantizes a convolution through a 16-bit multiplier and an addition
+## through the Q31 one.
 ##
 ## `mac` is a *primitive*, not sugar for `acc += a * b`, and that is the whole
 ## point of the file. Some accumulators support fused multiply-accumulate and
@@ -105,6 +115,11 @@ type
     ## TFLite-style affine quantization: real = scale * (q - zeroPoint).
     ## int8 storage, int32 accumulation, Q31 multiplier + shift on the way out.
 
+  AffineI16x8* = object
+    ## TFLite's 16x8 format: int16 activations with zero point 0, int8
+    ## weights, an int32 accumulator whose range the host checks layer by layer
+    ## (TFLite's is int64), and the 16-bit multiplier TFLite uses for it.
+
   AffineParams* = object
     ## Per-op requantization metadata. `mult` and `shift` point at const
     ## (flash-resident) arrays emitted by the host compiler.
@@ -114,6 +129,9 @@ type
     ## branch and without duplicating a per-tensor scale N times in flash.
     mult*: ptr UncheckedArray[int32]
     shift*: ptr UncheckedArray[int32]
+    ##
+    ## For `AffineI16x8`'s matmul family `mult` is TFLite's 16-bit reduced
+    ## multiplier, worked out on the host; see `reducedMultiplier`.
     channelStride*: int
     outZeroPoint*: int32
     actMin*, actMax*: int32     ## fused activation clamp, quantized domain
@@ -123,9 +141,16 @@ type
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 template Store*(_: typedesc[AffineI8]): typedesc = int8
+template Weight*(_: typedesc[AffineI8]): typedesc = int8
 template Accum*(_: typedesc[AffineI8]): typedesc = int32
 template Bias*(_: typedesc[AffineI8]): typedesc = int32
 template Params*(_: typedesc[AffineI8]): typedesc = AffineParams
+
+template Store*(_: typedesc[AffineI16x8]): typedesc = int16
+template Weight*(_: typedesc[AffineI16x8]): typedesc = int8
+template Accum*(_: typedesc[AffineI16x8]): typedesc = int32
+template Bias*(_: typedesc[AffineI16x8]): typedesc = int32
+template Params*(_: typedesc[AffineI16x8]): typedesc = AffineParams
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BLOCK WIDTHS
@@ -181,6 +206,10 @@ template OcBlock*(_: typedesc[AffineI8]): int = 4
 template DwBlock*(_: typedesc[AffineI8]): int = 4
 template FcBlock*(_: typedesc[AffineI8]): int = 4
 
+template OcBlock*(_: typedesc[AffineI16x8]): int = 4
+template DwBlock*(_: typedesc[AffineI16x8]): int = 4
+template FcBlock*(_: typedesc[AffineI16x8]): int = 4
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # GEMMLOWP FIXED-POINT REQUANTIZATION
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -233,5 +262,87 @@ func multiplyByQuantizedMultiplier*(x, quantizedMultiplier, shift: int32): int32
   roundingDivideByPOT(
     satRoundDoublingHighMul(x * (1'i32 shl leftShift), quantizedMultiplier),
     rightShift)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# 16x8 REQUANTIZATION
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# TFLite requantizes a 16x8 convolution through its int64 overload of
+# MultiplyByQuantizedMultiplier: the Q31 multiplier rounded to 16 bits, then
+# one shift that rounds a tie up. Not the gemmlowp path above, and it must
+# match just as exactly. The host reduces each multiplier once, so the kernel
+# only multiplies and shifts.
+
+func reducedMultiplier*(quantizedMultiplier: int32): int32 =
+  ## TFLite's 16-bit form of a Q31 multiplier.
+  if quantizedMultiplier < 0x7FFF0000'i32:
+    (quantizedMultiplier + (1'i32 shl 15)) shr 16
+  else:
+    0x7FFF'i32
+
+func multiplyByReducedMultiplier*(x, reduced, shift: int32): int32 {.inline.} =
+  ## `x * reduced * 2^(shift - 15)`, a tie rounded up. TFLite takes an int64
+  ## `x`; an int32 holds every sum the host has allowed. `shift` is below 8,
+  ## so the total shift is at least 8, and the product fits an int64.
+  let total = 15'i32 - shift
+  int32((int64(x) * int64(reduced) + (1'i64 shl (total - 1))) shr total)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# INT16 TANH
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# TFLite's int16 tanh, which is all integer: tanh(x) = 2 sigmoid(2x) - 1, from
+# a table of sigmoid(i / 24) in 0.16 fixed point, interpolated linearly. No
+# formula found regenerates the table, so it is TFLite's own.
+
+const sigmoidTableU16: array[256, uint16] = [
+  32768'u16, 33451, 34133, 34813, 35493, 36169, 36843, 37513, 38180, 38841, 39498, 40149,
+  40794, 41432, 42064, 42688, 43304, 43912, 44511, 45102, 45683, 46255, 46817, 47369,
+  47911, 48443, 48964, 49475, 49975, 50464, 50942, 51409, 51865, 52311, 52745, 53169,
+  53581, 53983, 54374, 54755, 55125, 55485, 55834, 56174, 56503, 56823, 57133, 57433,
+  57724, 58007, 58280, 58544, 58800, 59048, 59288, 59519, 59743, 59959, 60168, 60370,
+  60565, 60753, 60935, 61110, 61279, 61441, 61599, 61750, 61896, 62036, 62172, 62302,
+  62428, 62549, 62666, 62778, 62886, 62990, 63090, 63186, 63279, 63368, 63454, 63536,
+  63615, 63691, 63765, 63835, 63903, 63968, 64030, 64090, 64148, 64204, 64257, 64308,
+  64357, 64405, 64450, 64494, 64536, 64576, 64614, 64652, 64687, 64721, 64754, 64786,
+  64816, 64845, 64873, 64900, 64926, 64950, 64974, 64997, 65019, 65039, 65060, 65079,
+  65097, 65115, 65132, 65149, 65164, 65179, 65194, 65208, 65221, 65234, 65246, 65258,
+  65269, 65280, 65291, 65301, 65310, 65319, 65328, 65337, 65345, 65352, 65360, 65367,
+  65374, 65381, 65387, 65393, 65399, 65404, 65410, 65415, 65420, 65425, 65429, 65433,
+  65438, 65442, 65445, 65449, 65453, 65456, 65459, 65462, 65465, 65468, 65471, 65474,
+  65476, 65479, 65481, 65483, 65485, 65488, 65489, 65491, 65493, 65495, 65497, 65498,
+  65500, 65501, 65503, 65504, 65505, 65507, 65508, 65509, 65510, 65511, 65512, 65513,
+  65514, 65515, 65516, 65517, 65517, 65518, 65519, 65520, 65520, 65521, 65522, 65522,
+  65523, 65523, 65524, 65524, 65525, 65525, 65526, 65526, 65526, 65527, 65527, 65528,
+  65528, 65528, 65529, 65529, 65529, 65529, 65530, 65530, 65530, 65530, 65531, 65531,
+  65531, 65531, 65531, 65532, 65532, 65532, 65532, 65532, 65532, 65533, 65533, 65533,
+  65533, 65533, 65533, 65533, 65533, 65534, 65534, 65534, 65534, 65534, 65534, 65534,
+  65534, 65534, 65534, 65535
+]
+  ## `sigmoid_table_uint16` from TensorFlow Lite's
+  ## tensorflow/lite/kernels/internal/common.h, copyright The TensorFlow
+  ## Authors, under the Apache License, Version 2.0.
+
+func tanhInt16*(x: int16, inputMultiplier, inputLeftShift: int32): int16 =
+  ## TFLite's reference int16 tanh, for an output scale of 2^-15. The host
+  ## works out `inputMultiplier` and `inputLeftShift` from the input scale, as
+  ## TFLite's TanhPrepare does; a multiplier of 0 means a power-of-two scale.
+  var mult = inputMultiplier
+  var leftShift = inputLeftShift
+  if mult == 0:
+    mult = 3'i32 shl leftShift
+    leftShift = 0
+  let round = if leftShift > 0: 1'i32 shl (leftShift - 1) else: 0'i32
+  let input = (int32(x) * mult + round) shr leftShift
+  let magnitude = uint32(abs(input))
+  let hi = magnitude shr 8
+  var r: int32
+  if hi >= 255:
+    r = 0xFFFF'i32 shl 8
+  else:
+    let a = uint32(sigmoidTableU16[hi])
+    let b = uint32(sigmoidTableU16[hi + 1])
+    r = int32((a shl 8) + (magnitude and 0xFF) * (b - a))
+  r = if input >= 0: r - (1'i32 shl 23) + (1'i32 shl 7)
+      else: -r + (1'i32 shl 23) + (1'i32 shl 7) - 1
+  int16(r shr 8)
 
 when hostOS == "any": {.pop.}

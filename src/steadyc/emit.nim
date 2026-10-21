@@ -105,6 +105,12 @@ proc emitArrayBody(s: var string, dtype: DType, count: int, data: seq[byte]) =
     for i in 0 ..< count:
       if i mod PerLine == 0: s.add "\n  "
       s.add $cast[int8](data[i]) & ","
+  of dtInt16:
+    for i in 0 ..< count:
+      if i mod 10 == 0: s.add "\n  "
+      var v: int16
+      copyMem(addr v, unsafeAddr data[i * 2], 2)
+      s.add $v & ","
   of dtInt32:
     for i in 0 ..< count:
       if i mod 8 == 0: s.add "\n  "
@@ -197,6 +203,7 @@ proc storeLiteral(p: PolicyKind, v: int32): string =
   ## A Store-typed literal for clamp bounds and pad values.
   case p
   of pkAffineI8: &"{v}'i8"
+  of pkAffineI16x8: &"{v}'i16"
 
 proc storeLiteralF(p: PolicyKind, q: Quant, v: float64): string =
   ## A Store-typed literal for a *real* value the graph specified — the pad
@@ -205,18 +212,22 @@ proc storeLiteralF(p: PolicyKind, q: Quant, v: float64): string =
   ## the caller ever spelling that out.
   case p
   of pkAffineI8: &"{quantizedValue(p, q, v)}'i8"
+  of pkAffineI16x8: &"{quantizedValue(p, q, v)}'i16"
 
 proc biasLiteral(p: PolicyKind, v: int32): string =
   ## A Bias-typed literal, in accumulator units: it carries a folded
   ## zero-point correction rather than the model's own bias value.
   case p
-  of pkAffineI8: &"{v}'i32"
+  of pkAffineI8, pkAffineI16x8: &"{v}'i32"
 
 proc clampLiteral(p: PolicyKind, fused: FusedAct, outQ: Quant): (string, string) =
   case p
   of pkAffineI8:
     let (lo, hi) = affineActRange(fused, outQ)
     (&"{lo}'i8", &"{hi}'i8")
+  of pkAffineI16x8:
+    let (lo, hi) = affineActRange(fused, outQ, -32768'i32, 32767'i32)
+    (&"{lo}'i16", &"{hi}'i16")
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # MAIN EMITTER
@@ -411,6 +422,8 @@ const
         if op.kind == okFullyConnected: wT.shape[0]
         elif op.kind == okConv2d: wT.shape[0]
         else: wT.shape[3]
+      if g.policy == pkAffineI16x8:
+        checkAccumulator(g, op)
       let rp = resolveMatmulParams(g, g.tensors[x], wT, g.tensors[y],
                                    op.fused, outC)
       let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
@@ -547,9 +560,17 @@ const
                   &"    {xs[1]}, {xs[2]}, {xs[3]})\n"
 
     of okLogistic, okTanh:
+      let x = op.inputs[0]
+      if g.policy == pkAffineI16x8:
+        # No table of every input for 16 bits: TFLite's integer tanh, whose
+        # input scaling is worked out here.
+        let (mult, leftShift) = resolveTanhInt16Params(g.tensors[x])
+        opCalls.add &"  tanh16({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                    &"{g.tensors[y].numElements}, {mult}'i32, {leftShift}'i32)\n"
+        opChunks.add opCalls[mark .. ^1]
+        continue
       # The activation is evaluated on the host at all 256 representable
       # inputs and quantized into flash; the target does a load.
-      let x = op.inputs[0]
       let lut = buildLut(g.policy, g.tensors[x].quant, g.tensors[y].quant,
                          activationFn(op.kind))
       let sym = emitConst(cSym(g, &"lut{oi}_", op.name),
@@ -572,6 +593,22 @@ const
                   &"{rows}, {classes}, {castConst(sym, dtInt32)},\n" &
                   &"    {rp.mult[0]}'i32, {rp.shift[0]}'i32, " &
                   &"{rp.outZeroPoint}'i32, {rp.qActMin}'i32, {rp.qActMax}'i32)\n"
+
+    of okLeakyRelu:
+      let x = op.inputs[0]
+      let lp = resolveLeakyReluParams(g.tensors[x], g.tensors[y], op.alpha)
+      opCalls.add &"  leakyRelu1d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                  &"{g.tensors[y].numElements},\n    {lp.inZero}'i32, {lp.outZero}'i32, " &
+                  &"{lp.identityMult}'i32, {lp.identityShift}'i32, " &
+                  &"{lp.alphaMult}'i32, {lp.alphaShift}'i32)\n"
+
+    of okSlice:
+      let x = op.inputs[0]
+      let xs = g.tensors[x].shape
+      let ys = g.tensors[y].shape
+      opCalls.add &"  slice2d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                  &"{xs[2]}, {xs[3]}, {ys[1]}, {ys[2]}, {ys[3]}, " &
+                  &"{op.begin[1]}, {op.begin[2]}, {op.begin[3]})\n"
 
     of okReshape:
       discard

@@ -30,6 +30,7 @@
 
 import std/[strformat, tables, sets, math, os]
 import ./ir, ./flatbuffers
+from ./quant import fromInt32
 from ./emit import cIdent, nimIdentKey
 
 # A malformed file raises `FbError` from the reader; callers want to catch that
@@ -113,6 +114,18 @@ const
 
   # table AddOptions
   addFusedActivation = 0
+  addPotScaleInt16 = 1
+
+  # table LeakyReluOptions
+  leakyAlpha = 0
+
+  # table StridedSliceOptions
+  ssBeginMask = 0
+  ssEndMask = 1
+  ssEllipsisMask = 2
+  ssNewAxisMask = 3
+  ssShrinkAxisMask = 4
+  ssOffset = 5
 
   # table ConcatenationOptions
   catAxis = 0
@@ -160,6 +173,8 @@ const
   bopTanh = 28
   bopPad = 34
   bopMean = 40
+  bopStridedSlice = 45
+  bopLeakyRelu = 98
   bopQuantize = 114
 
 func builtinName(code: int): string =
@@ -183,6 +198,8 @@ func builtinName(code: int): string =
   of bopTanh: "TANH"
   of bopPad: "PAD"
   of bopMean: "MEAN"
+  of bopStridedSlice: "STRIDED_SLICE"
+  of bopLeakyRelu: "LEAKY_RELU"
   of bopQuantize: "QUANTIZE"
   else: &"builtin #{code}"
 
@@ -198,11 +215,11 @@ func dtypeOf(tt: int, where: string): DType =
       "absorb — it leaves a data-dependent term that has to be computed on " &
       "the device. Re-convert the model with TFLite's int8 post-training " &
       "quantization.")
-  of ttInt16:
-    raise newException(TfliteError,
-      &"{where} is int16; only int8 and float32 graphs are supported")
+  of ttInt16: dtInt16
   of ttInt64:
-    raise newException(TfliteError, &"{where} is int64, which no kernel consumes")
+    raise newException(TfliteError,
+      &"{where} is int64, which no kernel consumes; only a 16x8 model's " &
+      "biases may be, and they are narrowed to int32")
   else:
     raise newException(TfliteError, &"{where} has unsupported tensor type {tt}")
 
@@ -446,25 +463,27 @@ proc stripBoundary(r: var Reader): seq[bool] =
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 proc choosePolicy(r: Reader, keep: seq[bool]): PolicyKind =
-  ## Decided by what the activations are stored as. Weights and activations
-  ## always agree in a converted model; biases are int32 and say nothing.
+  ## Decided by what the activations are stored as, which is what every op
+  ## writes. Weights are int8 under both policies, and biases say nothing.
   var sawInt8 = false
+  var sawInt16 = false
   var sawFloat = false
   for oi, op in r.ops:
     if not keep[oi]: continue
-    for t in op.inputs & op.outputs:
+    for t in op.outputs:
       if t < 0: continue
       case r.tensors[t].typeCode
       of ttInt8: sawInt8 = true
+      of ttInt16: sawInt16 = true
       of ttFloat32: sawFloat = true
-      of ttInt32: discard                         # bias or parameter
       else:
         discard dtypeOf(r.tensors[t].typeCode, &"tensor '{r.tensors[t].name}'")
-  if sawInt8 and sawFloat:
+  if int(sawInt8) + int(sawInt16) + int(sawFloat) > 1:
     raise newException(TfliteError,
-      "the graph mixes int8 and float32 activations; one graph is compiled " &
-      "under one numeric policy")
+      "the graph mixes activation types (int8, int16, float32); one graph is " &
+      "compiled under one numeric policy")
   if sawInt8: return pkAffineI8
+  if sawInt16: return pkAffineI16x8
   if sawFloat:
     raise newException(TfliteError,
       "this model has float32 activations; only int8-quantized models are " &
@@ -496,6 +515,9 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
     if op.code in [bopReshape, bopPad, bopMean] and
        op.inputs.len > 1 and op.inputs[1] >= 0:
       isParam.incl op.inputs[1]
+    if op.code == bopStridedSlice:
+      for t in op.inputs[1 .. ^1]:
+        if t >= 0: isParam.incl t
 
   var needed = initHashSet[int]()
   for oi, op in r.ops:
@@ -539,9 +561,24 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
       uname = &"{t.name}_t{ti}"
     usedNames.incl nimIdentKey(uname)
 
-    let dtype = dtypeOf(t.typeCode, &"tensor '{t.name}'")
     let quant = Quant(scales: t.scales, zeroPoints: t.zeroPoints, axis: t.quantDim)
 
+    if t.typeCode == ttInt64 and policy == pkAffineI16x8 and r.hasData(t.bufferIdx):
+      # A 16x8 bias. TFLite sums in int64; the kernels sum in int32, which
+      # the host checks is enough for each layer, so the bias must fit too.
+      let raw = r.bufferBytes(t.bufferIdx)
+      var narrowed: seq[int32]
+      for i in 0 ..< raw.len div 8:
+        var v: int64
+        copyMem(addr v, unsafeAddr raw[i * 8], 8)
+        if v < low(int32) or v > high(int32):
+          raise newException(TfliteError,
+            &"bias '{t.name}' holds {v}, beyond an int32 accumulator")
+        narrowed.add int32(v)
+      idx[ti] = g.addConst(uname, shape, dtInt32, fromInt32(narrowed), quant)
+      continue
+
+    let dtype = dtypeOf(t.typeCode, &"tensor '{t.name}'")
     if r.hasData(t.bufferIdx):
       idx[ti] = g.addConst(uname, shape, dtype, r.bufferBytes(t.bufferIdx), quant)
     elif ti in inputSet:
@@ -627,6 +664,7 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
     of bopAdd:
       built.kind = okAdd
       built.fused = fusedOf(op.optByte(addFusedActivation, actNone), nm)
+      built.potScaleInt16 = op.optBool(addPotScaleInt16, true)
       if op.inputs.len < 2:
         raise newException(TfliteError, &"op '{nm}': ADD needs two operands")
       built.inputs = @[ir(op.inputs[0]), ir(op.inputs[1])]
@@ -679,6 +717,48 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
           &"op '{nm}': softmax beta is {beta}; only 1.0 is supported. Beta " &
           "would fold into the exp table, but no converter emits it for int8 " &
           "and an untested path is worse than an error.")
+
+    of bopLeakyRelu:
+      built.kind = okLeakyRelu
+      built.alpha = float64(op.optF32(leakyAlpha, 0'f32))
+      built.inputs = @[ir(op.inputs[0])]
+
+    of bopStridedSlice:
+      built.kind = okSlice
+      built.inputs = @[ir(op.inputs[0])]
+      if op.inputs.len != 4:
+        raise newException(TfliteError,
+          &"op '{nm}': STRIDED_SLICE needs begin, end and strides")
+      for (field, what) in [(ssEllipsisMask, "ellipsis"), (ssNewAxisMask, "new axis"),
+                            (ssShrinkAxisMask, "shrink axis")]:
+        if op.optI(field, 0) != 0:
+          raise newException(TfliteError,
+            &"op '{nm}': STRIDED_SLICE with a {what} mask is not supported")
+      if op.optBool(ssOffset, false):
+        raise newException(TfliteError, &"op '{nm}': STRIDED_SLICE offset is not supported")
+      let dims = r.tensors[op.inputs[0]].shape
+      var first = r.constInts(op.inputs[1], &"op '{nm}' begin")
+      var last = r.constInts(op.inputs[2], &"op '{nm}' end")
+      let strides = r.constInts(op.inputs[3], &"op '{nm}' strides")
+      let beginMask = op.optI(ssBeginMask, 0)
+      let endMask = op.optI(ssEndMask, 0)
+      if first.len != dims.len or last.len != dims.len or strides.len != dims.len:
+        raise newException(TfliteError,
+          &"op '{nm}': begin, end and strides must give one value per dimension")
+      for d in 0 ..< dims.len:
+        if strides[d] != 1:
+          raise newException(TfliteError,
+            &"op '{nm}': only stride 1 is supported, got {strides}")
+        if (beginMask shr d and 1) != 0: first[d] = 0
+        if (endMask shr d and 1) != 0: last[d] = dims[d]
+        if first[d] < 0: first[d] += dims[d]
+        if last[d] < 0: last[d] += dims[d]
+        let outDim = g.tensors[built.outputs[0]].shape[d]
+        if last[d] - first[d] != outDim and not (d == 0 and outDim == 1):
+          raise newException(TfliteError,
+            &"op '{nm}': slice [{first[d]}, {last[d]}) of dimension {d} does " &
+            &"not give the output's {outDim}")
+      built.begin = first
 
     of bopRelu, bopRelu6, bopReluN1To1:
       built.kind = okClamp

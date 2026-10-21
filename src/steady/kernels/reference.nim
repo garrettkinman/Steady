@@ -112,11 +112,11 @@ macro unrolled*(idx: untyped, n: static int, body: untyped): untyped =
 # FULLY CONNECTED
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-proc fullyConnected*[P, S, B, PT](
+proc fullyConnected*[P, S, W, B, PT](
     _: typedesc[P],
     y: ptr UncheckedArray[S],
     x: ptr UncheckedArray[S],
-    w: ptr UncheckedArray[S],
+    w: ptr UncheckedArray[W],
     bias: ptr UncheckedArray[B],
     prm: PT,
     outDim, inDim: int) =
@@ -130,6 +130,7 @@ proc fullyConnected*[P, S, B, PT](
   const Fc = fcBlockOf(P)
   static:
     assert S is Store(P), "fullyConnected: storage type mismatch"
+    assert W is Weight(P), "fullyConnected: weight type mismatch"
     assert B is Bias(P), "fullyConnected: bias type mismatch"
     assert PT is Params(P), "fullyConnected: params type mismatch"
 
@@ -156,11 +157,11 @@ proc fullyConnected*[P, S, B, PT](
 # CONV2D  (NHWC activations, OHWI filters, batch 1)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-proc conv2d*[P, S, B, PT](
+proc conv2d*[P, S, W, B, PT](
     _: typedesc[P],
     y: ptr UncheckedArray[S],
     x: ptr UncheckedArray[S],
-    w: ptr UncheckedArray[S],
+    w: ptr UncheckedArray[W],
     bias: ptr UncheckedArray[B],
     prm: PT,
     inH, inW, inC: int,
@@ -216,6 +217,7 @@ proc conv2d*[P, S, B, PT](
   const Oc = ocBlockOf(P)
   static:
     assert S is Store(P), "conv2d: storage type mismatch"
+    assert W is Weight(P), "conv2d: weight type mismatch"
     assert B is Bias(P), "conv2d: bias type mismatch"
     assert PT is Params(P), "conv2d: params type mismatch"
 
@@ -310,11 +312,11 @@ proc conv2d*[P, S, B, PT](
 # DEPTHWISE CONV2D  (NHWC activations, 1HWC filters)
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-proc depthwiseConv2d*[P, S, B, PT](
+proc depthwiseConv2d*[P, S, W, B, PT](
     _: typedesc[P],
     y: ptr UncheckedArray[S],
     x: ptr UncheckedArray[S],
-    w: ptr UncheckedArray[S],
+    w: ptr UncheckedArray[W],
     bias: ptr UncheckedArray[B],
     prm: PT,
     inH, inW, inC: int,
@@ -350,6 +352,7 @@ proc depthwiseConv2d*[P, S, B, PT](
   const Dw = dwBlockOf(P)
   static:
     assert S is Store(P), "depthwiseConv2d: storage type mismatch"
+    assert W is Weight(P), "depthwiseConv2d: weight type mismatch"
     assert B is Bias(P), "depthwiseConv2d: bias type mismatch"
     assert PT is Params(P), "depthwiseConv2d: params type mismatch"
 
@@ -582,7 +585,7 @@ proc addElementwise*[P, S, PT](
     var acc = zeroAccum(P)
     addRescaled(P, acc, a[i], aMult, aShift, aZero)
     addRescaled(P, acc, b[i], bMult, bShift, bZero)
-    y[i] = finish(P, acc, prm, 0)
+    y[i] = finishRescaled(P, acc, prm)
 
 proc copy1d*[P, S](
     _: typedesc[P],
@@ -593,6 +596,58 @@ proc copy1d*[P, S](
     assert S is Store(P), "copy1d: storage type mismatch"
   for i in 0 ..< n:
     y[i] = x[i]
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# LEAKY RELU
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc leakyRelu1d*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    n: int,
+    inZero, outZero: int32,
+    identityMult, identityShift, alphaMult, alphaShift: int32) =
+  ## TFLite's quantized LeakyReLU, the same arithmetic for every integer
+  ## store: each side of zero has its own multiplier, the identity's and
+  ## alpha's, and the result saturates to the store.
+  static:
+    assert S is Store(P), "leakyRelu1d: storage type mismatch"
+  for i in 0 ..< n:
+    let v = int32(x[i]) - inZero
+    var r =
+      if v >= 0: multiplyByQuantizedMultiplier(v, identityMult, identityShift)
+      else: multiplyByQuantizedMultiplier(v, alphaMult, alphaShift)
+    r += outZero
+    if r < int32(low(S)): r = int32(low(S))
+    if r > int32(high(S)): r = int32(high(S))
+    y[i] = S(r)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# SLICE  (NHWC, batch 1)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc slice2d*[P, S](
+    _: typedesc[P],
+    y: ptr UncheckedArray[S],
+    x: ptr UncheckedArray[S],
+    inW, inC: int,
+    outH, outW, outC: int,
+    top, left, first: int) =
+  ## The block of `x` starting at row `top`, column `left` and channel
+  ## `first`, copied out. A crop in one dimension of an NHWC tensor is a
+  ## contiguous run, and copying it costs little next to the convolutions
+  ## around it; an alias at an offset would cost nothing, and the arena
+  ## planner does not yet do those.
+  static:
+    assert S is Store(P), "slice2d: storage type mismatch"
+  var o = 0
+  for oy in 0 ..< outH:
+    for ox in 0 ..< outW:
+      let base = ((top + oy) * inW + left + ox) * inC + first
+      for c in 0 ..< outC:
+        y[o] = x[base + c]
+        inc o
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # PAD  (NHWC, spatial only, batch 1)
@@ -688,7 +743,7 @@ proc concatSliceRescaled*[P, S, PT](
     for i in 0 ..< innerIn:
       var acc = zeroAccum(P)
       addRescaled(P, acc, x[src + i], mult, shift, offset)
-      y[dst + i] = finish(P, acc, prm, 0)
+      y[dst + i] = finishRescaled(P, acc, prm)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # MEAN  (reduction over H and W — global average)
@@ -756,6 +811,17 @@ proc lut1d*[P, S](
     assert S is Store(P), "lut1d: storage type mismatch"
   for i in 0 ..< n:
     y[i] = table[lutIndex(P, x[i])]
+
+proc tanh16*[P](
+    _: typedesc[P],
+    y: ptr UncheckedArray[int16],
+    x: ptr UncheckedArray[int16],
+    n: int,
+    inputMultiplier, inputLeftShift: int32) =
+  ## Tanh for a 16-bit store, which has no table of every input: TFLite's
+  ## interpolated sigmoid table instead, `tanhInt16`.
+  for i in 0 ..< n:
+    y[i] = tanhInt16(x[i], inputMultiplier, inputLeftShift)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # SOFTMAX

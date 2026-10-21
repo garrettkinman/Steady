@@ -24,6 +24,7 @@
 
 import std/[math, strformat]
 import ./ir
+from ../steady/contract import reducedMultiplier
 
 type
   ResolvedParams* = object
@@ -50,6 +51,12 @@ const RescaleLeftShift* = 20
   ## before their Q31 multiply, to keep precision through the rescale. Must
   ## match `AddLeftShift` in the runtime's policy module — the host computes
   ## multipliers relative to it and the kernel applies it.
+
+func addLeftShift*(p: PolicyKind): int =
+  ## `RescaleLeftShift` for int8; TFLite's int16 ADD shifts by 15.
+  case p
+  of pkAffineI8: RescaleLeftShift
+  of pkAffineI16x8: 15
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # TFLITE MULTIPLIER ENCODING
@@ -120,18 +127,29 @@ proc zeroAt*(q: Quant, ch: int): int32 =
 # FUSED ACTIVATION -> CLAMP BOUNDS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-proc quantizeValue(v: float64, scale: float64, zero: int32): int32 =
+proc quantizeValue(v: float64, scale: float64, zero, lo, hi: int32): int32 =
   let q = int32(round(v / scale)) + zero
-  max(-128'i32, min(127'i32, q))
+  max(lo, min(hi, q))
 
-proc affineActRange*(fused: FusedAct, outQ: Quant): (int32, int32) =
+proc affineActRange*(fused: FusedAct, outQ: Quant,
+                     lo = -128'i32, hi = 127'i32): (int32, int32) =
+  ## Clamp bounds for a store whose range is `lo .. hi`, int8's unless given.
   let s = outQ.scaleAt(0)
   let z = outQ.zeroAt(0)
   case fused
-  of faNone:       (-128'i32, 127'i32)
-  of faRelu:       (max(-128'i32, z), 127'i32)
-  of faRelu6:      (max(-128'i32, z), quantizeValue(6.0, s, z))
-  of faReluN1To1:  (quantizeValue(-1.0, s, z), quantizeValue(1.0, s, z))
+  of faNone:       (lo, hi)
+  of faRelu:       (max(lo, z), hi)
+  of faRelu6:      (max(lo, z), quantizeValue(6.0, s, z, lo, hi))
+  of faReluN1To1:  (quantizeValue(-1.0, s, z, lo, hi), quantizeValue(1.0, s, z, lo, hi))
+
+proc affineActRange*(fused: FusedAct, outT: Tensor): (int32, int32) =
+  ## Clamp bounds for the store `outT` is written in.
+  let (lo, hi) =
+    case outT.dtype
+    of dtInt8: (-128'i32, 127'i32)
+    of dtInt16: (-32768'i32, 32767'i32)
+    else: raise newException(QuantError, &"tensor '{outT.name}' is not an integer store")
+  affineActRange(fused, outT.quant, lo, hi)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # PARAMETER RESOLUTION
@@ -151,10 +169,11 @@ proc resolveMatmulParams*(g: Graph, inT, wT, outT: Tensor,
   for c in 0 ..< n:
     let effective = (inScale * wT.quant.scaleAt(c)) / outScale
     let (m, s) = quantizeMultiplier(effective)
-    result.mult[c] = m
+    # 16x8 requantizes through a 16-bit multiplier, reduced here once.
+    result.mult[c] = if g.policy == pkAffineI16x8: reducedMultiplier(m) else: m
     result.shift[c] = s
   result.outZeroPoint = outT.quant.zeroAt(0)
-  let (lo, hi) = affineActRange(fused, outT.quant)
+  let (lo, hi) = affineActRange(fused, outT)
   result.qActMin = lo
   result.qActMax = hi
 
@@ -164,8 +183,8 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
   ## carry different scales and there is no per-channel constant to fold
   ## them into. TFLite pre-shifts both operands left by 20 to preserve
   ## precision, so each input multiplier is taken relative to a common
-  ## domain 2^20 times finer than the larger input scale.
-  const LeftShift = RescaleLeftShift
+  ## domain 2^20 times finer than the larger input scale; 2^15 for int16.
+  let LeftShift = addLeftShift(g.policy)
   let aScale = aT.quant.scaleAt(0)
   let bScale = bT.quant.scaleAt(0)
   let outScale = outT.quant.scaleAt(0)
@@ -182,7 +201,7 @@ proc resolveAddParams*(g: Graph, aT, bT, outT: Tensor,
   params.mult = @[om]
   params.shift = @[osh]
   params.outZeroPoint = outT.quant.zeroAt(0)
-  let (lo, hi) = affineActRange(fused, outT.quant)
+  let (lo, hi) = affineActRange(fused, outT)
   params.qActMin = lo
   params.qActMax = hi
 
@@ -323,3 +342,63 @@ proc padValueFor*(g: Graph, inT: Tensor): int32 =
   ## is exactly what keeps the folded bias valid at the edges. Padding with a
   ## literal zero would be padding with `-Zx` in real terms.
   inT.quant.zeroAt(0)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# 16x8
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc checkAccumulator*(g: Graph, op: Op) =
+  ## A 16x8 kernel sums in int32 where TFLite sums in int64. The sums are
+  ## exact either way, so they agree whenever no output channel can leave an
+  ## int32: every tap at the largest input magnitude, plus the bias.
+  let wT = g.tensors[op.inputs[1]]
+  let w = wT.asInt8
+  let bias = g.tensors[op.inputs[2]].asInt32
+  let outC = wT.shape[0]
+  let taps = w.len div outC
+  for o in 0 ..< outC:
+    var bound = abs(int64(bias[o]))
+    for k in 0 ..< taps:
+      bound += abs(int64(w[o * taps + k])) * 32768
+    if bound > int64(high(int32)):
+      raise newException(QuantError,
+        &"op '{op.name}': output channel {o} can reach {bound}, beyond the " &
+        "int32 accumulator of AffineI16x8")
+
+type LeakyParams* = object
+  inZero*, outZero*: int32
+  identityMult*, identityShift*, alphaMult*, alphaShift*: int32
+
+proc resolveLeakyReluParams*(inT, outT: Tensor, alpha: float64): LeakyParams =
+  ## TFLite's LeakyReluPrepare, which works the two scales out in float32:
+  ## its operands are floats, and only the result is widened.
+  let inScale = float32(inT.quant.scaleAt(0))
+  let outScale = float32(outT.quant.scaleAt(0))
+  let (am, ash) = quantizeMultiplier(float64(inScale * float32(alpha) / outScale))
+  let (im, ish) = quantizeMultiplier(float64(inScale / outScale))
+  LeakyParams(inZero: inT.quant.zeroAt(0), outZero: outT.quant.zeroAt(0),
+              identityMult: im, identityShift: ish, alphaMult: am, alphaShift: ash)
+
+proc checkedLog2(x: float32): (bool, int32) =
+  ## TFLite's CheckedLog2, in float32 as it is there: whether `x` is a power
+  ## of two, to within 1e-3 of an exponent, and which.
+  let l = ln(x) * (1'f32 / ln(2'f32))
+  let r = round(l)
+  (abs(l - r) < 1e-3'f32, int32(r))
+
+proc resolveTanhInt16Params*(inT: Tensor): tuple[mult, leftShift: int32] =
+  ## TFLite's TanhPrepare for int16: a multiplier taking the input to the
+  ## table's scale, 1 / (3 * 4096), or none for a power-of-two scale.
+  const InputIntegerBits = 3
+  let scale = float32(inT.quant.scaleAt(0))
+  var (pot, log2Rounded) = checkedLog2(scale)
+  var leftShift = (15 - InputIntegerBits) + log2Rounded
+  pot = pot and leftShift in [0'i32, 1]
+  if pot:
+    return (0'i32, leftShift)
+  var multiplier = float64(scale) * 4096.0 * 3.0
+  leftShift = 0
+  while multiplier <= 32767.0 / 2.0 and leftShift <= 30:
+    inc leftShift
+    multiplier *= 2.0
+  (int32(multiplier), leftShift)

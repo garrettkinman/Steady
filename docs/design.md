@@ -17,20 +17,26 @@ what accumulates, what the bias looks like, what metadata the store step needs �
 operations between them.
 
 ```nim
-Store(P)   Accum(P)   Bias(P)   Params(P)
+Store(P)   Weight(P)   Accum(P)   Bias(P)   Params(P)
 
 zeroAccum(P) -> Accum
-mac(P, acc: var Accum, a, b: Store)
+mac(P, acc: var Accum, w: Weight, x: Store)
 addBias(P, acc: var Accum, b: Bias)
 finish(P, acc: Accum, prm: Params, ch: int) -> Store
+finishRescaled(P, acc: Accum, prm: Params) -> Store
 ```
 
 Plus one member only 8-bit policies have: `lutIndex(P, v: Store) -> int`, the raw storage byte of a
 value. Its presence *is* the statement "this storage type has 256 values and the host can tabulate a
 function over it" — see [Non-linear activations](#non-linear-activations).
 
-One policy ships: `AffineI8` — int8 storage, int32 accumulation, a Q31 multiplier and shift on the
-way out.
+Two policies ship: `AffineI8` — int8 storage, int32 accumulation, a Q31 multiplier and shift on the
+way out — and `AffineI16x8`, TFLite's 16x8 format: int16 activations with zero point 0, int8
+weights, and on the way out of a convolution the 16-bit multiplier and single rounding shift TFLite
+uses for it. `finish` ends a convolution and `finishRescaled` an addition; they are one arithmetic
+for `AffineI8` and two for `AffineI16x8`, where TFLite's ADD keeps the Q31 path. TFLite sums 16x8
+convolutions in int64; Steady sums in int32, which gives the same answer because integer sums are
+exact, and the host refuses a layer whose weights and bias could take an output channel beyond it.
 
 **`mac` is a primitive, not sugar for `acc += a * b`,** and that is the reason the contract exists
 at all rather than the kernels simply being written in int8. Some accumulators support fused

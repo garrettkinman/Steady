@@ -23,9 +23,9 @@ integer semantics, which is what this compiler targets.
 The division of labour is deliberate. This script does not choose the inputs
 and does not know the model's quantization: the Nim side writes both, because
 after the importer strips a boundary QUANTIZE the graph's input quantization is
-a property of a tensor that was internal to the file. Here we take int8 codes,
-present them to the interpreter in whatever domain it wants, and hand back int8
-codes in the domain the compiled model produces. Both conversions are exact.
+a property of a tensor that was internal to the file. Here we take integer codes,
+present them to the interpreter in whatever domain it wants, and hand back codes
+in the domain the compiled model produces. Both conversions are exact.
 """
 
 import sys
@@ -58,8 +58,8 @@ def make_interpreter(model_path, all_tensors=False):
 
 
 def feed(interp, inp, q, in_scale, in_zero):
-    if inp["dtype"] == np.int8:
-        value = q.astype(np.int8).reshape(inp["shape"])
+    if inp["dtype"] in (np.int8, np.int16):
+        value = q.astype(inp["dtype"]).reshape(inp["shape"])
     elif inp["dtype"] == np.float32:
         # The model quantizes internally; feeding the exact real values these
         # int8 codes stand for makes that step a round trip.
@@ -71,7 +71,7 @@ def feed(interp, inp, q, in_scale, in_zero):
 
 
 def to_codes(values, dtype, scale, zero):
-    if dtype == np.int8:
+    if dtype in (np.int8, np.int16):
         return values.astype(np.int32)
     if dtype == np.float32:
         # Invert the trailing DEQUANTIZE the importer stripped.
@@ -115,7 +115,7 @@ def mode_tensors(model_path, io_path, out_path):
     written = 0
     with open(out_path, "w") as f:
         for d in interp.get_tensor_details():
-            if d["dtype"] != np.int8:
+            if d["dtype"] not in (np.int8, np.int16):
                 continue
             try:
                 v = interp.get_tensor(d["index"]).reshape(-1)

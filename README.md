@@ -153,8 +153,9 @@ today. Over-the-air model replacement is out of scope by construction.
 
 - **Arithmetic is a seam, not a hardcoding.** Kernels are generic over a *numeric policy* that
   abstracts what happens between accumulate and store, and `mac` is a primitive rather than sugar
-  for `acc += a * b`. One policy ships — `AffineI8`, int8 storage and int32 accumulation — because
-  that is what interchange formats carry. The abstraction is there for what plugs into it: an
+  for `acc += a * b`. Two policies ship — `AffineI8`, int8 storage and int32 accumulation, and
+  `AffineI16x8`, TFLite's int16 activations over int8 weights, which a model producing audio needs —
+  because those are what interchange formats carry. The abstraction is there for what plugs into it: an
   accumulator a hardware unit owns, a core whose multiply-accumulate is one instruction. Kernels
   written around `+=` close that door, and reopening it means rewriting every kernel rather than
   adding a file. Note the limit, since it is easy to overclaim: a paired-MAC instruction like
@@ -186,7 +187,13 @@ activations, the TFLite importer, and the backend hooks in detail.
 
 Implemented: `Conv2D`, `DepthwiseConv2D`, `FullyConnected`, `MaxPool2D`, `AveragePool2D`, `Add`,
 `Clamp` (ReLU / ReLU6 / ReLUN1To1), `Reshape` (free — resolved by aliasing), `Pad`, `Concatenation`,
-`Mean` (over H and W, i.e. global average), `Logistic`, `Tanh`, `Softmax`.
+`Mean` (over H and W, i.e. global average), `Logistic`, `Tanh`, `Softmax`, `LeakyReLU`, and
+`StridedSlice` with stride 1 (a crop, copied).
+
+Under `AffineI16x8` the set is what has been matched against TFLite so far: `Conv2D`, `Add`,
+`Reshape`, `LeakyReLU`, `StridedSlice` and `Tanh`, the rest refused by name. There, `Tanh` is TFLite's
+own integer one, an interpolated table of the sigmoid, since a 16-bit store has no table of every
+input; and the int32 accumulator, where TFLite's is int64, is checked layer by layer on the host.
 
 `Logistic` and `Tanh` are lookup tables the host builds by evaluating the true function at all 256
 representable inputs, so the device does a load rather than arithmetic — no libm, no software float,
@@ -221,7 +228,7 @@ shift, so a float on the target would mean something was left to runtime that sh
 The placement check matters more than it looks: a module-level `let` lands in `.data` and is copied
 into RAM at startup, which on a part with 64 KB of SRAM and 512 KB of flash is exactly backwards.
 
-**Against TFLite itself.** `nimble models` compiles seven real int8 models with `steadyc` and
+**Against TFLite itself.** `nimble models` compiles seven real int8 models and one 16x8 with `steadyc` and
 compares every intermediate tensor against TFLite's own **reference** kernels — not the optimized
 path, which delegates to XNNPACK and requantizes int8 differently from anything a microcontroller
 runs. Comparing every tensor rather than just the output attributes a divergence to an *operator*
@@ -236,6 +243,10 @@ rather than to a model.
 | `mobilenet_v2` | 1000-class softmax, 3.4 MB of weights, 10 residual adds | exact but for the mean |
 | `ad` | ten stacked fully-connected layers | 1 LSB per layer |
 | `person_detect` | MobileNetV1 0.25; compiles, but modern TFLite refuses to load it | compile only |
+| `tinytts_decoder` | TinyTTS's decoder for one chunk: int16 activations, dilated 1xk convolutions, LeakyReLU, crops, 16-bit tanh | every tensor exact |
+
+`tinytts_decoder` is not published; the TinyTTS demo's export writes it, to be copied into
+`tests/models/`.
 
 Both divergences have the same cause: desktop TFLite evaluates int8 `FULLY_CONNECTED` and its
 generic `MEAN` reducer in float, while its convolutions use gemmlowp fixed point. Steady is fixed

@@ -112,6 +112,24 @@ template addElementwise*(P: typedesc, y, a, b, prm, n: untyped,
            reference.addElementwise(P, y, a, b, prm, n, aMult, aShift,
                                     bMult, bShift, aZero, bZero))
 
+template leakyRelu1d*(P: typedesc, y, x, n, inZero, outZero,
+                      identityMult, identityShift, alphaMult, alphaShift: untyped) =
+  dispatch(steady_backend.leakyRelu1d(P, y, x, n, inZero, outZero, identityMult,
+                                      identityShift, alphaMult, alphaShift),
+           reference.leakyRelu1d(P, y, x, n, inZero, outZero, identityMult,
+                                 identityShift, alphaMult, alphaShift))
+
+template slice2d*(P: typedesc, y, x, inW, inC, outH, outW, outC,
+                  top, left, first: untyped) =
+  dispatch(steady_backend.slice2d(P, y, x, inW, inC, outH, outW, outC,
+                                  top, left, first),
+           reference.slice2d(P, y, x, inW, inC, outH, outW, outC,
+                             top, left, first))
+
+template tanh16*(P: typedesc, y, x, n, inputMultiplier, inputLeftShift: untyped) =
+  dispatch(steady_backend.tanh16(P, y, x, n, inputMultiplier, inputLeftShift),
+           reference.tanh16(P, y, x, n, inputMultiplier, inputLeftShift))
+
 template copy1d*(P: typedesc, y, x, n: untyped) =
   dispatch(steady_backend.copy1d(P, y, x, n),
            reference.copy1d(P, y, x, n))

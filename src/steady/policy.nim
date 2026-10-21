@@ -31,8 +31,8 @@ export contract
 
 template zeroAccum*(_: typedesc[AffineI8]): int32 = 0'i32
 
-template mac*(_: typedesc[AffineI8], acc: var int32, a, b: int8) =
-  acc = acc + int32(a) * int32(b)
+template mac*(_: typedesc[AffineI8], acc: var int32, w, x: int8) =
+  acc = acc + int32(w) * int32(x)
 
 template addBias*(_: typedesc[AffineI8], acc: var int32, b: int32) =
   acc = acc + b
@@ -43,6 +43,10 @@ func finish*(_: typedesc[AffineI8], acc: int32, prm: AffineParams, ch: int): int
   if v < prm.actMin: v = prm.actMin
   if v > prm.actMax: v = prm.actMax
   int8(v)
+
+func finishRescaled*(_: typedesc[AffineI8], acc: int32, prm: AffineParams): int8 {.inline.} =
+  ## The same arithmetic as `finish`, for an elementwise op.
+  finish(AffineI8, acc, prm, 0)
 
 template lowestStore*(_: typedesc[AffineI8]): int8 = low(int8)
 
@@ -95,5 +99,44 @@ func addRescaled*(_: typedesc[AffineI8], acc: var int32, v: int8,
   ## negated zero point. The fixed left shift of 20 matches TFLite's ADD
   ## reference and exists to preserve precision before the Q31 multiply.
   const AddLeftShift = 20'i32
+  let shifted = (int32(v) + offset) * (1'i32 shl AddLeftShift)
+  acc = acc + multiplyByQuantizedMultiplier(shifted, mult, shift)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# AffineI16x8
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Zero points are 0 throughout, so there is nothing to fold and padding is 0.
+# Only the members the ops the host allows for this policy need.
+
+template zeroAccum*(_: typedesc[AffineI16x8]): int32 = 0'i32
+
+template mac*(_: typedesc[AffineI16x8], acc: var int32, w: int8, x: int16) =
+  acc = acc + int32(w) * int32(x)
+
+template addBias*(_: typedesc[AffineI16x8], acc: var int32, b: int32) =
+  acc = acc + b
+
+func finish*(_: typedesc[AffineI16x8], acc: int32, prm: AffineParams, ch: int): int16 {.inline.} =
+  ## `prm.mult` holds reduced multipliers; see `reducedMultiplier`.
+  let i = ch * prm.channelStride
+  var v = multiplyByReducedMultiplier(acc, prm.mult[i], prm.shift[i])
+  if v < prm.actMin: v = prm.actMin
+  if v > prm.actMax: v = prm.actMax
+  int16(v)
+
+func finishRescaled*(_: typedesc[AffineI16x8], acc: int32, prm: AffineParams): int16 {.inline.} =
+  ## Through the Q31 multiplier, as TFLite's int16 ADD does.
+  var v = multiplyByQuantizedMultiplier(acc, prm.mult[0], prm.shift[0])
+  if v < prm.actMin: v = prm.actMin
+  if v > prm.actMax: v = prm.actMax
+  int16(v)
+
+template lowestStore*(_: typedesc[AffineI16x8]): int16 = low(int16)
+
+func addRescaled*(_: typedesc[AffineI16x8], acc: var int32, v: int16,
+                  mult, shift, offset: int32) {.inline.} =
+  ## As for `AffineI8`, with TFLite's left shift for 16 bits, 15: two
+  ## operands of 65535 << 15 still sum within an int32.
+  const AddLeftShift = 15'i32
   let shifted = (int32(v) + offset) * (1'i32 shl AddLeftShift)
   acc = acc + multiplyByQuantizedMultiplier(shifted, mult, shift)

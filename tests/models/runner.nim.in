@@ -23,25 +23,27 @@ import std/[os, strutils, strformat, sequtils, tables]
 import steadyc
 import ./@MODEL@ as model
 
-proc lcg(seed: uint32, n: int): seq[int32] =
+proc lcg(seed: uint32, n: int, lo, hi: int32): seq[int32] =
+  ## Uniform over the store's range, int8's or int16's.
   result = newSeq[int32](n)
   var s = seed
   for i in 0 ..< n:
     s = s * 1664525'u32 + 1013904223'u32
-    result[i] = int32((s shr 16) and 0xFF'u32) - 128'i32
+    result[i] = lo + int32((s shr 16) and uint32(hi - lo))
 
 proc constant(v: int32, n: int): seq[int32] =
   newSeqWith(n, v)
 
-proc trialsFor(nIn: int, count: int, inZero: int32): seq[seq[int32]] =
+proc trialsFor(nIn: int, count: int, inZero: int32, store: DType): seq[seq[int32]] =
   ## Random draws, plus the corners. Saturation and the zero point are where a
   ## quantized kernel and a reference implementation part company, so they are
   ## not left to chance.
+  let (lo, hi) = if store == dtInt16: (-32768'i32, 32767'i32) else: (-128'i32, 127'i32)
   result.add constant(inZero, nIn)
-  result.add constant(-128'i32, nIn)
-  result.add constant(127'i32, nIn)
+  result.add constant(lo, nIn)
+  result.add constant(hi, nIn)
   for i in 0 ..< count:
-    result.add lcg(97'u32 + uint32(i) * 7919'u32, nIn)
+    result.add lcg(97'u32 + uint32(i) * 7919'u32, nIn, lo, hi)
 
 proc gen(modelPath, ioPath: string, count: int) =
   let g = importTfliteFile(modelPath)
@@ -59,12 +61,12 @@ proc gen(modelPath, ioPath: string, count: int) =
   s.add &"in_zero {inZero}\n"
   s.add &"out_scale {outScale:.17e}\n"
   s.add &"out_zero {outZero}\n"
-  for t in trialsFor(inT.numElements, count, inZero):
+  for t in trialsFor(inT.numElements, count, inZero, inT.dtype):
     var line = "trial"
     for v in t: line.add " " & $v
     s.add line & "\n"
   writeFile(ioPath, s)
-  echo &"    {trialsFor(inT.numElements, count, inZero).len} trials, " &
+  echo &"    {trialsFor(inT.numElements, count, inZero, inT.dtype).len} trials, " &
        &"{inT.numElements} in, {outT.numElements} out"
 
 proc readTrials(path: string): tuple[meta: seq[(string, string)], trials: seq[seq[int32]]] =
@@ -99,7 +101,7 @@ proc check(ioPath, refPath: string, tolerance: int) =
 
   for i, input in io.trials:
     let inp = model.input0()
-    for j, v in input: inp[j] = int8(v)
+    for j, v in input: inp[j] = typeof(inp[0])(v)
     model.invoke()
     let outp = model.output0()
 
@@ -128,6 +130,16 @@ proc check(ioPath, refPath: string, tolerance: int) =
        &"argmax agrees {top1}/{io.trials.len}"
   if worst > tolerance:
     quit &"FAIL: max difference {worst} exceeds the tolerance of {tolerance}", 1
+
+proc fileName(name: string): string =
+  ## The tensor's name in the model file. The importer appends `_t<index>` to
+  ## one that collides with another as an identifier, and TFLite's dump has
+  ## it as written; matched only as given, such tensors went uncompared.
+  let i = name.rfind("_t")
+  if i > 0 and i + 2 < name.len and name[i + 2 .. ^1].allCharsInSet(Digits):
+    name[0 ..< i]
+  else:
+    name
 
 proc tensors(modelPath, ioPath, refPath: string) =
   ## Per-operator attribution. Runs the *simulator* over trial 0 and compares
@@ -172,9 +184,10 @@ proc tensors(modelPath, ioPath, refPath: string) =
   var firstBad = -1
   var worst = 0
   for ti, t in g.tensors:
-    if t.dtype != dtInt8 or ti notin bufs: continue
-    if t.name notin reference: continue
-    let want = reference[t.name]
+    if t.dtype notin {dtInt8, dtInt16} or ti notin bufs: continue
+    let name = if t.name in reference: t.name else: fileName(t.name)
+    if name notin reference: continue
+    let want = reference[name]
     let got = bufs[ti]
     if want.len != got.len: continue
     inc compared

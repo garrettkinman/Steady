@@ -14,18 +14,18 @@
 ## downstream (validation, folding, planning, emission) is written against
 ## the IR rather than against any file format.
 
-import std/[strformat, strutils, tables]
+import std/[math, strformat, strutils, tables]
 
 type
   DType* = enum
-    dtInt8, dtInt32, dtFloat32
+    dtInt8, dtInt16, dtInt32, dtFloat32
 
   PolicyKind* = enum
-    ## One policy ships. The enum stays because the emitted module names its
-    ## policy and because the numeric-policy seam is the compiler's shape, not
-    ## because a second value is expected soon — see `steady/contract.nim` for
-    ## what the abstraction is actually for, and what was removed from it.
+    ## Chosen by what a graph's activations are stored as. See
+    ## `steady/contract.nim` for what the abstraction is for, what was removed
+    ## from it, and why the second policy is there.
     pkAffineI8
+    pkAffineI16x8   ## int16 activations, int8 weights
 
   TensorKind* = enum
     tkInput        ## supplied by the caller each invocation
@@ -43,7 +43,8 @@ type
     okFullyConnected, okConv2d, okDepthwiseConv2d,
     okMaxPool2d, okAvgPool2d, okAdd, okClamp, okReshape,
     okPad, okConcatenation, okMean,
-    okLogistic, okTanh, okSoftmax
+    okLogistic, okTanh, okSoftmax,
+    okLeakyRelu, okSlice
 
   Quant* = object
     ## Per-tensor when `scales` has one entry, per-channel when it has one
@@ -78,6 +79,9 @@ type
     pads*: seq[array[2, int]]
     padConst*: float64
     axis*: int                 ## okConcatenation
+    alpha*: float64            ## okLeakyRelu: the slope below zero
+    begin*: seq[int]           ## okSlice: the first index in each dimension
+    potScaleInt16*: bool       ## okAdd: TFLite's flag for its power-of-two int16 path
     axes*: seq[int]            ## okMean, normalized by validate()
     keepDims*: bool            ## okMean
     # Filled in by validate(); explicit padding derived from `padding`.
@@ -99,11 +103,13 @@ type
 func byteWidth*(d: DType): int =
   case d
   of dtInt8: 1
+  of dtInt16: 2
   of dtInt32, dtFloat32: 4
 
 func nimTypeName*(d: DType): string =
   case d
   of dtInt8: "int8"
+  of dtInt16: "int16"
   of dtInt32: "int32"
   of dtFloat32: "float32"
 
@@ -112,20 +118,34 @@ func cTypeName*(d: DType): string =
   ## models are going to run.
   case d
   of dtInt8: "int8_t"
+  of dtInt16: "int16_t"
   of dtInt32: "int32_t"
   of dtFloat32: "float"
 
 func policyName*(p: PolicyKind): string =
   case p
   of pkAffineI8: "AffineI8"
+  of pkAffineI16x8: "AffineI16x8"
 
 func storeType*(p: PolicyKind): DType =
   case p
   of pkAffineI8: dtInt8
+  of pkAffineI16x8: dtInt16
+
+func weightType*(p: PolicyKind): DType =
+  ## int8 for both: 16x8 is int8 weights under int16 activations.
+  dtInt8
 
 func biasType*(p: PolicyKind): DType =
-  case p
-  of pkAffineI8: dtInt32       ## accumulator units, zero point pre-folded
+  ## Accumulator units, zero point pre-folded. TFLite's 16x8 biases are int64;
+  ## the importer narrows them, refusing one that does not fit.
+  dtInt32
+
+func storeRange*(p: PolicyKind): (int32, int32) =
+  case p.storeType
+  of dtInt8: (-128'i32, 127'i32)
+  of dtInt16: (-32768'i32, 32767'i32)
+  else: raise newException(ValueError, &"{p} has no integer store")
 
 func hasLutDomain*(p: PolicyKind): bool =
   ## True when the storage type's whole value domain is small enough for the
@@ -272,6 +292,12 @@ proc validate*(g: var Graph) =
       check t in produced, nm,
         &"input tensor '{g.tensors[t].name}' is consumed before it is produced"
 
+    # The ops TFLite's reference kernels have been matched on for 16x8. The
+    # others would compile, perhaps rightly; unchecked, they are refused.
+    check g.policy != pkAffineI16x8 or
+          op.kind in {okConv2d, okAdd, okReshape, okTanh, okLeakyRelu, okSlice}, nm,
+      &"{op.kind} is not supported under {g.policy.policyName} yet"
+
     case op.kind
     of okFullyConnected:
       check op.inputs.len == 3, nm, "expects [input, weights, bias]"
@@ -288,14 +314,19 @@ proc validate*(g: var Graph) =
         &"bias has {b.numElements} elements but output dim is {outDim}"
       check y.numElements == outDim, nm,
         &"output has {y.numElements} elements, expected {outDim}"
-      check x.dtype == storeDt and w.dtype == storeDt and y.dtype == storeDt, nm,
-        "input/weights/output dtype must match the graph policy storage type"
+      check x.dtype == storeDt and y.dtype == storeDt, nm,
+        "input/output dtype must match the graph policy storage type"
+      check w.dtype == g.policy.weightType, nm,
+        &"weights must be {g.policy.weightType}"
       check b.dtype == biasDt, nm, &"bias dtype must be {biasDt}"
 
     of okConv2d, okDepthwiseConv2d:
       check op.inputs.len == 3, nm, "expects [input, filter, bias]"
       let x = g.tensors[op.inputs[0]]
       let w = g.tensors[op.inputs[1]]
+      check w.dtype == g.policy.weightType, nm,
+        &"filter must be {g.policy.weightType}"
+      check g.tensors[op.inputs[2]].dtype == biasDt, nm, &"bias dtype must be {biasDt}"
       check x.shape.len == 4, nm, &"input must be NHWC rank 4, got {x.shape}"
       check x.shape[0] == 1, nm, "only batch size 1 is supported"
       check w.shape.len == 4, nm, &"filter must be rank 4, got {w.shape}"
@@ -357,6 +388,16 @@ proc validate*(g: var Graph) =
         "broadcasting is not supported"
       check g.tensors[op.outputs[0]].numElements == a.numElements, nm,
         "output element count must match operands"
+      if g.policy == pkAffineI16x8:
+        # TFLite takes another path when all three scales are powers of two
+        # and this flag allows it; nothing here implements that one.
+        var pot = op.potScaleInt16
+        for t in [a, b, g.tensors[op.outputs[0]]]:
+          let l = log2(t.quant.scales[0])
+          pot = pot and abs(l - round(l)) < 1e-3
+        check not pot, nm,
+          "int16 ADD with power-of-two scales takes TFLite's special path, " &
+          "which is not implemented"
 
     of okClamp:
       check g.tensors[op.outputs[0]].numElements ==
@@ -454,10 +495,19 @@ proc validate*(g: var Graph) =
 
     of okLogistic, okTanh:
       check op.inputs.len == 1, nm, "expects one input"
-      check g.policy.hasLutDomain, nm,
-        &"{op.kind} is evaluated from a host-generated lookup table, which " &
-        &"needs an 8-bit storage type; policy {g.policy.policyName} stores " &
-        &"{storeDt}"
+      if op.kind == okTanh and g.policy == pkAffineI16x8:
+        # TFLite's int16 tanh, not a table of every input
+        let xq = g.tensors[op.inputs[0]].quant
+        let yq = g.tensors[op.outputs[0]].quant
+        check xq.zeroPoints.len == 0 or xq.zeroPoints[0] == 0, nm,
+          "int16 tanh needs input zero point 0"
+        check yq.scales.len == 1 and abs(log2(yq.scales[0]) + 15.0) < 1e-3, nm,
+          "int16 tanh needs output scale 2^-15"
+      else:
+        check g.policy.hasLutDomain, nm,
+          &"{op.kind} is evaluated from a host-generated lookup table, which " &
+          &"needs an 8-bit storage type; policy {g.policy.policyName} stores " &
+          &"{storeDt}"
       check g.tensors[op.outputs[0]].numElements ==
             g.tensors[op.inputs[0]].numElements, nm,
         "must preserve element count"
@@ -486,6 +536,32 @@ proc validate*(g: var Graph) =
       check x.dtype == storeDt and y.dtype == storeDt, nm,
         "input/output dtype must match the graph policy storage type"
       check op.fused == faNone, nm, "softmax has no fused activation"
+
+    of okLeakyRelu:
+      check op.inputs.len == 1, nm, "expects one input"
+      let x = g.tensors[op.inputs[0]]
+      let y = g.tensors[op.outputs[0]]
+      check y.numElements == x.numElements, nm, "must preserve element count"
+      check x.dtype == storeDt and y.dtype == storeDt, nm,
+        "input/output dtype must match the graph policy storage type"
+      check op.alpha >= 0.0, nm,
+        &"alpha {op.alpha} is negative; TFLite's quantizer takes no negative scale"
+
+    of okSlice:
+      check op.inputs.len == 1, nm, "expects one input"
+      let x = g.tensors[op.inputs[0]]
+      let y = g.tensors[op.outputs[0]]
+      check x.shape.len == 4 and y.shape.len == 4, nm,
+        &"only NHWC rank 4 is sliced, got {x.shape} -> {y.shape}"
+      check x.shape[0] == 1, nm, "only batch size 1 is supported"
+      check op.begin.len == 4 and op.begin[0] == 0, nm,
+        &"begin {op.begin} must give one index per dimension, batch 0"
+      for d in 0 ..< 4:
+        check op.begin[d] >= 0 and op.begin[d] + y.shape[d] <= x.shape[d], nm,
+          &"slice of {y.shape} from {op.begin} falls outside {x.shape}"
+      check sameQuant(x.quant, y.quant), nm,
+        "slice copies its input through unchanged, so input and output " &
+        "quantization must be identical"
 
     for t in op.outputs:
       check t notin produced, nm,
@@ -537,6 +613,10 @@ proc summary*(g: Graph): string =
     of okMean:
       attrs.add &"axes {op.axes}"
       if op.keepDims: attrs.add "keepDims"
+    of okLeakyRelu:
+      attrs.add &"alpha {op.alpha}"
+    of okSlice:
+      attrs.add &"begin {op.begin}"
     else: discard
     if op.fused != faNone:
       attrs.add $op.fused

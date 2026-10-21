@@ -159,3 +159,38 @@ suite "activation ranges":
   test "no fused activation spans the full int8 range":
     let q = Quant(scales: @[0.05], zeroPoints: @[3'i32], axis: -1)
     check affineActRange(faNone, q) == (-128'i32, 127'i32)
+
+suite "16x8 requantization":
+
+  test "the multiplier is rounded to 16 bits, a tie up, and saturates":
+    check reducedMultiplier(1073741824'i32) == 16384'i32          # 2^30, one half
+    check reducedMultiplier(1073741824'i32 + 32768'i32) == 16385'i32
+    check reducedMultiplier(0x7FFEFFFF'i32) == 0x7FFF'i32
+    check reducedMultiplier(high(int32)) == 0x7FFF'i32
+
+  test "rounds a tie up, where gemmlowp's shift rounds it away from zero":
+    # -6 * 0.5 * 2^-1 = -1.5. TFLite's 16x8 path gives -1, its int8 path -2,
+    # and a 16x8 model must have the first.
+    check multiplyByReducedMultiplier(-6'i32, 16384'i32, -1'i32) == -1'i32
+    check multiplyByQuantizedMultiplier(-6'i32, 1073741824'i32, -1'i32) == -2'i32
+    check multiplyByReducedMultiplier(3'i32, 16384'i32, 0'i32) == 2'i32
+    check multiplyByReducedMultiplier(-3'i32, 16384'i32, 0'i32) == -1'i32
+
+suite "int16 tanh":
+  # Expected values from a transcription of TFLite's reference_integer_ops::Tanh
+
+  test "a power-of-two input scale, 2^-12":
+    check tanhInt16(0'i16, 0'i32, 0'i32) == 0'i16
+    check tanhInt16(4096'i16, 0'i32, 0'i32) == 24956'i16            # tanh(1)
+    check tanhInt16(-4096'i16, 0'i32, 0'i32) == -24956'i16
+    check tanhInt16(1'i16, 0'i32, 0'i32) == 8'i16
+    check tanhInt16(high(int16), 0'i32, 0'i32) == 32767'i16
+    check tanhInt16(low(int16), 0'i32, 0'i32) == -32767'i16
+
+  test "any other scale takes a multiplier, as TFLite's TanhPrepare works it out":
+    let t = Tensor(name: "x", dtype: dtInt16,
+                   quant: Quant(scales: @[0.0003], zeroPoints: @[0'i32], axis: -1))
+    let (mult, leftShift) = resolveTanhInt16Params(t)
+    check (mult, leftShift) == (30198'i32, 13'i32)
+    check tanhInt16(3333'i16, mult, leftShift) == 24954'i16
+    check tanhInt16(-3333'i16, mult, leftShift) == -24954'i16

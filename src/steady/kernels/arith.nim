@@ -93,6 +93,9 @@ template addBias*(P: typedesc, acc, b: untyped) =
 template finish*(P: typedesc, acc, prm, ch: untyped): untyped =
   viaArith(steady_arith.finish(P, acc, prm, ch), policy.finish(P, acc, prm, ch))
 
+template finishRescaled*(P: typedesc, acc, prm: untyped): untyped =
+  viaArith(steady_arith.finishRescaled(P, acc, prm), policy.finishRescaled(P, acc, prm))
+
 template lowestStore*(P: typedesc): untyped =
   viaArith(steady_arith.lowestStore(P), policy.lowestStore(P))
 
