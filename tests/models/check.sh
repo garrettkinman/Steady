@@ -67,10 +67,26 @@ TRIALS="${STEADY_TRIALS:-5}"
 # division in the kernel first, as this compiler originally did, disagreed on
 # 130 channels instead of 4.
 #
-# tinytts_decoder is the one 16x8 model: int16 activations and int8 weights,
+# tinytts_decoder is a 16x8 model: int16 activations and int8 weights,
 # TFLite's own integer tanh, LeakyReLU and crops. It is not published; the
 # TinyTTS demo's `export/quantize.py` writes it as `decoder_16x8_f32.tflite`,
 # to be copied here under this name.
+#
+# The two `_open` models are the same graphs with the length left open, as the
+# demo runs them, `encoder_16x8.tflite` and `flow_16x8.tflite` there: compiled
+# with a bound, the fourth field, and each trial run at a length of its own,
+# from 1 to the bound, against TFLite's interpreter resized to it.
+#
+# The two `g2p` models are g2p_en's GRU, which spells for TinyTTS a word its
+# dictionary lacks, a step at a time: `export/g2p_gru.py` writes them as
+# `g2p_encoder_16x8.tflite` and `g2p_decoder_16x8.tflite`.
+#
+# tinytts_encoder and tinytts_flow are the rest of TinyTTS, its front, at a
+# fixed length: relative attention, LayerNorm written out (MEAN, SUB, MUL,
+# RSQRT), BATCH_MATMUL between activations, int16 softmax, broadcasting, and
+# the encoder's three GATHERs from int32 inputs. `export/quantize_front.py 64`
+# in the TinyTTS demo writes them as `encoder_16x8_64.tflite` and
+# `flow_16x8_64.tflite`.
 #
 # person_detect is compile-only: modern TFLite refuses to load it, because its
 # 2019 converter wrote quantized_dimension 3 on rank-1 bias tensors. This
@@ -85,6 +101,12 @@ MODELS=(
   "ad|3|10 stacked fully-connected layers, no softmax"
   "person_detect|-1|MobileNetV1 0.25 96x96; rejected by modern TFLite"
   "tinytts_decoder|0|TinyTTS's decoder for one chunk, int16 activations (16x8): bit-exact"
+  "tinytts_encoder|0|TinyTTS's text encoder and duration predictor, 64 phones, 16x8: bit-exact"
+  "tinytts_flow|0|TinyTTS's flow in reverse, 64 frames: attention and LayerNorm at 16x8, bit-exact"
+  "tinytts_encoder_open|0|the encoder for any number of phones to 96: bit-exact at each length|96"
+  "tinytts_flow_open|0|the flow for any number of frames to 128: bit-exact at each length|128"
+  "tinytts_g2p_encoder|0|g2p_en's GRU, one step of its encoder, int16 LOGISTIC and TANH: bit-exact"
+  "tinytts_g2p_decoder|0|one step of its decoder, and the phones' logits: bit-exact"
 )
 
 if ! ls "$DIR"/*.tflite >/dev/null 2>&1; then
@@ -104,7 +126,7 @@ nim c --hints:off -d:release --path:"$ROOT/src" \
 
 failed=0
 for spec in "${MODELS[@]}"; do
-  IFS='|' read -r name tol note <<<"$spec"
+  IFS='|' read -r name tol note bound <<<"$spec"
   model="$DIR/$name.tflite"
   [ -f "$model" ] || { echo "==> $name: not fetched, skipping"; continue; }
 
@@ -114,7 +136,7 @@ for spec in "${MODELS[@]}"; do
   rm -rf "$out"
   mkdir -p "$out"
 
-  "$BUILD/steadyc" "$model" -o "$out" -n "$name" | sed 's/^/    /'
+  "$BUILD/steadyc" "$model" -o "$out" -n "$name" ${bound:+--bound "$bound"} | sed 's/^/    /'
 
   sed "s/@MODEL@/$name/g" "$DIR/runner.nim.in" > "$out/runner.nim"
   nim c --hints:off -d:release --path:"$ROOT/src" \
@@ -125,7 +147,7 @@ for spec in "${MODELS[@]}"; do
     continue
   fi
 
-  "$out/runner" gen "$model" "$out/io.txt" "$TRIALS"
+  "$out/runner" gen "$model" "$out/io.txt" "$TRIALS" ${bound:+"$bound"}
   "$PY" "$DIR/reference.py" outputs "$model" "$out/io.txt" "$out/ref.txt"
   if ! "$out/runner" check "$out/io.txt" "$out/ref.txt" "$tol"; then
     failed=1

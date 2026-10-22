@@ -147,3 +147,50 @@ proc buildExpLut*(inScale: float64, classes: int): tuple[table: seq[int32], bits
   for d in 0 ..< LutSize:
     t[d] = int32(round(exp(-float64(d) * inScale) * unit))
   (t, bits)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# INT16 TABLES
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# A 16-bit store has too many values to tabulate each, so TFLite tabulates 513
+# and interpolates (`lutLookup16` in the contract). Its tables are made from
+# the function, not shipped, so Steady makes them the same way: TFLite's
+# LUTPopulateInt16, step for step, in the precision TFLite uses for that op,
+# float32 for most and float64 where it keeps that for compatibility.
+
+proc lutPopulateInt16*[F: float32 | float64](inScale: F, inZero: int32,
+                                              outScale: F, outZero: int32,
+                                              f: proc (x: F): F): seq[int16] =
+  let inputMin = inScale * F(-32768'i32 - inZero)
+  let inputMax = inScale * F(32767'i32 - inZero)
+  let outputMin = outScale * F(-32768'i32 - outZero)
+  let outputMax = outScale * F(32767'i32 - outZero)
+  const steps = 512
+  let step = (inputMax - inputMin) / F(steps)
+  let halfStep = step / F(2)
+  let scaling = F(65536) / (outputMax - outputMin)
+  result = newSeq[int16](steps + 1)
+  for i in 0 ..< steps:
+    let v = f(inputMin + F(i) * step)
+    let midpoint = f(inputMin + F(i) * step + halfStep)
+    let next = f(inputMin + F(i + 1) * step)
+    let sample = round(v * scaling)
+    let interpolated = round((next * scaling + round(v * scaling)) / F(2))
+    let bias = round((interpolated - round(midpoint * scaling)) / F(2))
+    result[i] = int16(min(max(sample - bias, F(-32768)), F(32767)))
+  result[steps] = int16(min(max(round(f(inputMax) * scaling), F(-32768)), F(32767)))
+
+proc rsqrtLut16*(inScale, outScale: float32): seq[int16] =
+  ## TFLite's table for int16 RSQRT, in float32. At 0 and below it gives the
+  ## store's largest value, as TFLite's does.
+  lutPopulateInt16[float32](inScale, 0, outScale, 0, proc (x: float32): float32 =
+    if x <= 0'f32: 32767'f32 * outScale else: 1'f32 / sqrt(x))
+
+proc softmaxLuts16*(): tuple[exp, reciprocal: seq[int16]] =
+  ## TFLite's two tables for int16 softmax, in float64: exp over [-10, 0] and
+  ## 1 / (1 + x) over [0, 1], both onto [-1, 1]. They depend on nothing in the
+  ## model, so every softmax shares them.
+  const range = 65535.0
+  (lutPopulateInt16[float64](10.0 / range, 32767, 2.0 / range, 0,
+                             proc (x: float64): float64 = exp(x)),
+   lutPopulateInt16[float64](1.0 / range, -32768, 2.0 / range, 0,
+                             proc (x: float64): float64 = 1.0 / (1.0 + x)))

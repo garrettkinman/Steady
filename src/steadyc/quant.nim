@@ -113,6 +113,12 @@ proc fromInt32*(xs: seq[int32]): seq[byte] =
     var tmp = v
     copyMem(addr result[i * 4], addr tmp, 4)
 
+proc fromInt16*(xs: seq[int16]): seq[byte] =
+  result = newSeq[byte](xs.len * 2)
+  for i, v in xs:
+    var tmp = v
+    copyMem(addr result[i * 2], addr tmp, 2)
+
 proc scaleAt*(q: Quant, ch: int): float64 =
   if q.scales.len == 0:
     raise newException(QuantError, "missing quantization scale")
@@ -386,14 +392,15 @@ proc checkedLog2(x: float32): (bool, int32) =
   let r = round(l)
   (abs(l - r) < 1e-3'f32, int32(r))
 
-proc resolveTanhInt16Params*(inT: Tensor): tuple[mult, leftShift: int32] =
+proc resolveTanhInt16Params*(inT: Tensor, logistic = false): tuple[mult, leftShift: int32] =
   ## TFLite's TanhPrepare for int16: a multiplier taking the input to the
-  ## table's scale, 1 / (3 * 4096), or none for a power-of-two scale.
+  ## table's scale, 1 / (3 * 4096), or none for a power-of-two scale. Its
+  ## SigmoidPrepare is the same but for taking a shift of 1 as no power of two.
   const InputIntegerBits = 3
   let scale = float32(inT.quant.scaleAt(0))
   var (pot, log2Rounded) = checkedLog2(scale)
   var leftShift = (15 - InputIntegerBits) + log2Rounded
-  pot = pot and leftShift in [0'i32, 1]
+  pot = pot and (if logistic: leftShift == 0 else: leftShift in [0'i32, 1])
   if pot:
     return (0'i32, leftShift)
   var multiplier = float64(scale) * 4096.0 * 3.0
@@ -402,3 +409,49 @@ proc resolveTanhInt16Params*(inT: Tensor): tuple[mult, leftShift: int32] =
     inc leftShift
     multiplier *= 2.0
   (int32(multiplier), leftShift)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# 16x8: THE OPS OF A TRANSFORMER
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# Each multiplier as TFLite's Prepare works it out, down to whether it does so
+# in float32 or float64: a scale computed the other way can round to another
+# multiplier, and that is an LSB everywhere the op runs.
+
+proc rescaled(m: float64, outT: Tensor, fused: FusedAct): ResolvedParams =
+  let (q, s) = quantizeMultiplier(m)
+  result = ResolvedParams(mult: @[q], shift: @[s], outZeroPoint: outT.quant.zeroAt(0))
+  (result.qActMin, result.qActMax) = affineActRange(fused, outT)
+
+proc resolveMulParams*(aT, bT, outT: Tensor, fused: FusedAct): ResolvedParams =
+  ## TFLite's MulPrepare, whose product of scales is float32
+  let m = float32(aT.quant.scaleAt(0)) * float32(bT.quant.scaleAt(0)) /
+          float32(outT.quant.scaleAt(0))
+  rescaled(float64(m), outT, fused)
+
+proc resolveBatchMatmulParams*(aT, bT, outT: Tensor): ResolvedParams =
+  ## GetQuantizedConvolutionMultipler's: the operands' scales multiplied in
+  ## float32, divided in float64; then the 16-bit multiplier `finishProduct`
+  ## takes
+  let product = float64(float32(aT.quant.scaleAt(0)) * float32(bT.quant.scaleAt(0)))
+  result = rescaled(product / outT.quant.scaleAt(0), outT, faNone)
+  result.mult[0] = reducedMultiplier(result.mult[0])
+
+proc resolveMeanLastParams*(inT, outT: Tensor, count: int): ResolvedParams =
+  ## TFLite's integer MEAN: the ratio of scales as a Q31 multiplier, and the
+  ## division by `count` folded into it by an integer division, after a shift
+  ## of the multiplier by as many bits as `count` has, within 32.
+  result = rescaled(inT.quant.scaleAt(0) / outT.quant.scaleAt(0), outT, faNone)
+  var bits = 0'i32
+  while (2'i64 shl bits) <= int64(count): inc bits     # 63 - CountLeadingZeros(count)
+  bits = min(bits, 32'i32)
+  bits = min(bits, 31'i32 + result.shift[0])
+  result.mult[0] = int32((int64(result.mult[0]) shl bits) div int64(count))
+  result.shift[0] -= bits
+
+proc resolveRequantizeParams*(inT, outT: Tensor): ResolvedParams =
+  rescaled(inT.quant.scaleAt(0) / outT.quant.scaleAt(0), outT, faNone)
+
+proc resolveSoftmax16Params*(inT: Tensor): tuple[mult, shift: int32] =
+  ## The input's scale onto the exp table's [-10, 0], at a beta of 1: the
+  ## scale times beta is float32, the rest float64
+  quantizeMultiplier(float64(float32(inT.quant.scaleAt(0)) * 1'f32) / (10.0 / 65535.0))

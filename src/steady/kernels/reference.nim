@@ -25,7 +25,7 @@
 ## policy-agnostic, and the inner loop stays branch-free, which on a
 ## cacheless part is often faster than the bounds test it replaces.
 
-import std/macros
+import std/[macros, bitops]
 import ./arith
 
 # Inner loops, without Nim's checks on a bare-metal target. The host tests
@@ -883,5 +883,293 @@ proc softmax*[P, S](
       if q < actMin: q = actMin
       if q > actMax: q = actMax
       y[base + i] = S(q)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# TENSORS OF UP TO FOUR DIMENSIONS
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# A transformer's tensors are not images: [1, heads, T, d], [1, T, C], scores
+# of [1, heads, T, T]. These kernels take any shape of up to four dimensions,
+# the host having padded a shorter one with leading 1s, and walk the output in
+# address order. Where an operand is read from somewhere else than the output's
+# own position — broadcast, transposed, sliced — the host passes its stride for
+# each of the output's dimensions, 0 for one it is broadcast along.
+
+template eachOf4(dims: array[4, int], aStrides, bStrides: array[4, int],
+                 o, ia, ib, body: untyped) =
+  var o = 0
+  for i0 in 0 ..< dims[0]:
+    for i1 in 0 ..< dims[1]:
+      for i2 in 0 ..< dims[2]:
+        let ra = i0 * aStrides[0] + i1 * aStrides[1] + i2 * aStrides[2]
+        let rb = i0 * bStrides[0] + i1 * bStrides[1] + i2 * bStrides[2]
+        for i3 in 0 ..< dims[3]:
+          let ia = ra + i3 * aStrides[3]
+          let ib = rb + i3 * bStrides[3]
+          body
+          inc o
+
+proc add4d*[P, S, PT](
+    _: typedesc[P],
+    y, a, b: ptr UncheckedArray[S],
+    prm: PT,
+    dims, aStrides, bStrides: array[4, int],
+    aMult, aShift, bMult, bShift, aZero, bZero: int32) =
+  ## `addElementwise` with its operands broadcast to the output's shape
+  static:
+    assert S is Store(P), "add4d: storage type mismatch"
+  eachOf4(dims, aStrides, bStrides, o, ia, ib):
+    var acc = zeroAccum(P)
+    addRescaled(P, acc, a[ia], aMult, aShift, aZero)
+    addRescaled(P, acc, b[ib], bMult, bShift, bZero)
+    y[o] = finishRescaled(P, acc, prm)
+
+proc sub4d*[P, S, PT](
+    _: typedesc[P],
+    y, a, b: ptr UncheckedArray[S],
+    prm: PT,
+    dims, aStrides, bStrides: array[4, int],
+    aMult, aShift, bMult, bShift, aZero, bZero: int32) =
+  ## a - b, each rescaled into a common domain as for an addition
+  static:
+    assert S is Store(P), "sub4d: storage type mismatch"
+  eachOf4(dims, aStrides, bStrides, o, ia, ib):
+    var acc = zeroAccum(P)
+    addRescaled(P, acc, a[ia], aMult, aShift, aZero)
+    subRescaled(P, acc, b[ib], bMult, bShift, bZero)
+    y[o] = finishRescaled(P, acc, prm)
+
+proc mul4d*[P, S, PT](
+    _: typedesc[P],
+    y, a, b: ptr UncheckedArray[S],
+    prm: PT,
+    dims, aStrides, bStrides: array[4, int]) =
+  ## a * b, the product requantized once. The host has put both scales into
+  ## the output's multiplier, so there is nothing to rescale on the way in.
+  static:
+    assert S is Store(P), "mul4d: storage type mismatch"
+  eachOf4(dims, aStrides, bStrides, o, ia, ib):
+    y[o] = finishRescaled(P, mulStores(P, a[ia], b[ib]), prm)
+
+proc copy4d*[P, S](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    dims, strides: array[4, int],
+    first: int) =
+  ## The output filled from `x` at `first`, along `strides`: a transpose, or a
+  ## slice, which differ only in the strides and the start the host works out.
+  static:
+    assert S is Store(P), "copy4d: storage type mismatch"
+  eachOf4(dims, strides, strides, o, ia, ib):
+    y[o] = x[first + ia]
+
+proc pad4d*[P, S](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    dims, before, inDims: array[4, int],
+    padValue: S) =
+  ## Any of the four dimensions padded, before and after. The output is
+  ## walked once, each element either padding or the input's.
+  static:
+    assert S is Store(P), "pad4d: storage type mismatch"
+  var o = 0
+  for i0 in 0 ..< dims[0]:
+    for i1 in 0 ..< dims[1]:
+      for i2 in 0 ..< dims[2]:
+        let j0 = i0 - before[0]
+        let j1 = i1 - before[1]
+        let j2 = i2 - before[2]
+        let inside = j0 >= 0 and j0 < inDims[0] and j1 >= 0 and j1 < inDims[1] and
+                     j2 >= 0 and j2 < inDims[2]
+        let row = ((j0 * inDims[1] + j1) * inDims[2] + j2) * inDims[3]
+        for i3 in 0 ..< dims[3]:
+          let j3 = i3 - before[3]
+          y[o] = if inside and j3 >= 0 and j3 < inDims[3]: x[row + j3] else: padValue
+          inc o
+
+proc gather*[P, S](
+    _: typedesc[P],
+    y, table: ptr UncheckedArray[S],
+    indices: ptr UncheckedArray[int32],
+    n, inner: int) =
+  ## Row `indices[i]` of `table` for each `i`: an embedding. An index outside
+  ## the table is the caller's error, and is not checked on a board.
+  static:
+    assert S is Store(P), "gather: storage type mismatch"
+  for i in 0 ..< n:
+    let row = int(indices[i]) * inner
+    for k in 0 ..< inner:
+      y[i * inner + k] = table[row + k]
+
+proc requantize*[P, S](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    n: int,
+    mult, shift, inZero, outZero: int32) =
+  ## The same values in another scale, as TFLite's QUANTIZE from a store to
+  ## the same store does, through the Q31 multiplier
+  static:
+    assert S is Store(P), "requantize: storage type mismatch"
+  for i in 0 ..< n:
+    var v = multiplyByQuantizedMultiplier(int32(x[i]) - inZero, mult, shift) + outZero
+    if v < int32(low(S)): v = int32(low(S))
+    if v > int32(high(S)): v = int32(high(S))
+    y[i] = S(v)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# BATCH MATMUL  (between two activations)
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc batchMatmul*[P, S, PT](
+    _: typedesc[P],
+    y, a, b: ptr UncheckedArray[S],
+    prm: PT,
+    batches, rows, depth, cols: int,
+    aBatchStride, bBatchStride: int,
+    bTransposed: static bool) =
+  ## y[n, i, j] = finishProduct(sum over k of a[n, i, k] * b[n, k, j]), or of
+  ## b[n, j, k] when `bTransposed`, as attention's Q times K is. Both operands
+  ## are activations, so the sum is `ProductAccum(P)`, not `Accum(P)`. A batch
+  ## stride of 0 broadcasts that operand over the batches.
+  static:
+    assert S is Store(P), "batchMatmul: storage type mismatch"
+  for n in 0 ..< batches:
+    let aBase = n * aBatchStride
+    let bBase = n * bBatchStride
+    let yBase = n * rows * cols
+    for i in 0 ..< rows:
+      for j in 0 ..< cols:
+        var acc = zeroProduct(P)
+        for k in 0 ..< depth:
+          when bTransposed:
+            macStores(P, acc, a[aBase + i * depth + k], b[bBase + j * depth + k])
+          else:
+            macStores(P, acc, a[aBase + i * depth + k], b[bBase + k * cols + j])
+        y[yBase + i * cols + j] = finishProduct(P, acc, prm)
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# OVER THE LAST AXIS: MEAN AND SOFTMAX FOR A 16-BIT STORE
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+proc meanLastAxis*[P, S, PT](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    prm: PT,
+    rows, n: int) =
+  ## The mean of each row of `n`, as LayerNorm takes it over channels. The
+  ## division is in the multiplier the host works out the way TFLite's
+  ## integer MEAN does, so the sum is requantized once.
+  static:
+    assert S is Store(P), "meanLastAxis: storage type mismatch"
+  for r in 0 ..< rows:
+    var acc = zeroAccum(P)
+    for i in 0 ..< n:
+      accumulate(P, acc, x[r * n + i])
+    y[r] = finishRescaled(P, acc, prm)
+
+proc softmax16*[P](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[int16],
+    rows, classes: int,
+    expLut, reciprocalLut: ptr UncheckedArray[int16],
+    inputMultiplier, inputLeftShift: int32) =
+  ## TFLite's int16 softmax: each difference from the row's maximum through
+  ## a table of exp over [-10, 0], their sum's reciprocal through a table of
+  ## 1 / (1 + x), and the output in [0, 1] at a scale of 2^-15. The exps are
+  ## kept in `y` until the sum is known, as TFLite keeps them, so this may not
+  ## run in place.
+  for r in 0 ..< rows:
+    let base = r * classes
+    var mx = x[base]
+    for c in 1 ..< classes:
+      if x[base + c] > mx: mx = x[base + c]
+    var sum = 0'i32
+    for c in 0 ..< classes:
+      let scaled = multiplyByQuantizedMultiplier(int32(x[base + c]) - int32(mx),
+                                                 inputMultiplier, inputLeftShift) + 32767
+      let clamped = int16(max(-32768'i32, min(32767'i32, scaled)))
+      y[base + c] = lutLookup16(clamped, expLut)
+      sum += int32(y[base + c])
+    let headroom = int32(countLeadingZeroBits(uint32(sum)))
+    let shifted = int32(((int64(sum) shl (headroom - 1)) + (1'i64 shl 13)) shr 14)
+    let symmetric = int16(max(-32768'i32, min(32767'i32, shifted - ((1'i32 shl 15) + (1'i32 shl 16)))))
+    let reciprocal = int64(lutLookup16(symmetric, reciprocalLut))
+    let rightShift = 31 - headroom
+    for c in 0 ..< classes:
+      let v = int32((int64(y[base + c]) * reciprocal + (1'i64 shl (rightShift - 1))) shr rightShift)
+      y[base + c] = int16(max(0'i32, min(32767'i32, v)))
+
+proc logistic16*[P](
+    _: typedesc[P],
+    y: ptr UncheckedArray[int16],
+    x: ptr UncheckedArray[int16],
+    n: int,
+    inputMultiplier, inputLeftShift: int32) =
+  ## The logistic for a 16-bit store, TFLite's, `logisticInt16`
+  for i in 0 ..< n:
+    y[i] = logisticInt16(x[i], inputMultiplier, inputLeftShift)
+
+proc band*[P, S](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    batches, n, w, start: int,
+    padValue: S) =
+  ## Relative positions onto absolute ones: y[.., i, j] = x[.., i, j - i +
+  ## start], `padValue` where that is outside the w of x's row. What the
+  ## skew of relative attention does in five ops; see `steadyc/rewrite`.
+  static:
+    assert S is Store(P), "band: storage type mismatch"
+  for r in 0 ..< batches * n:
+    let i = r mod n
+    let first = max(0, i - start)
+    let last = min(n, i - start + w)      # One past
+    for j in 0 ..< first: y[r * n + j] = padValue
+    for j in first ..< last: y[r * n + j] = x[r * w + j - i + start]
+    for j in max(first, last) ..< n: y[r * n + j] = padValue
+
+proc unband*[P, S](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[S],
+    batches, n, w, start: int,
+    padValue: S) =
+  ## The other way: y[.., i, k] = x[.., i, i + k - start], `padValue` where
+  ## that is outside x's row of n
+  static:
+    assert S is Store(P), "unband: storage type mismatch"
+  for r in 0 ..< batches * n:
+    let i = r mod n
+    for k in 0 ..< w:
+      let j = i + k - start
+      y[r * w + k] = if j >= 0 and j < n: x[r * n + j] else: padValue
+
+proc addBand*[P, S, PT](
+    _: typedesc[P],
+    y, a, x: ptr UncheckedArray[S],
+    prm: PT,
+    batches, n, w, start: int,
+    aMult, aShift, bMult, bShift, aZero, bZero: int32) =
+  ## `addElementwise` of a and the band of x, `band` above, the band never
+  ## written: outside its window it is its zero point. `aMult` and the rest
+  ## are as for that ADD, with a the operand that is not the band.
+  static:
+    assert S is Store(P), "addBand: storage type mismatch"
+  for r in 0 ..< batches * n:
+    let i = r mod n
+    for j in 0 ..< n:
+      let k = j - i + start
+      let v = if k >= 0 and k < w: x[r * w + k] else: S(-bZero)
+      var acc = zeroAccum(P)
+      addRescaled(P, acc, a[r * n + j], aMult, aShift, aZero)
+      addRescaled(P, acc, v, bMult, bShift, bZero)
+      y[r * n + j] = finishRescaled(P, acc, prm)
+
+proc lut16*[P](
+    _: typedesc[P],
+    y, x: ptr UncheckedArray[int16],
+    n: int,
+    table: ptr UncheckedArray[int16]) =
+  ## A function of a 16-bit store through TFLite's interpolated table of 513
+  ## entries, as its int16 RSQRT is. Safe to run in place.
+  for i in 0 ..< n:
+    y[i] = lutLookup16(x[i], table)
 
 when hostOS == "any": {.pop.}

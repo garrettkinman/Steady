@@ -199,6 +199,9 @@ proc paramsExpr(g: Graph, rp: ResolvedParams, multSym, shiftSym: string,
   &"channelStride: {stride}, outZeroPoint: {rp.outZeroPoint}'i32, " &
   &"actMin: {rp.qActMin}'i32, actMax: {rp.qActMax}'i32)"
 
+func lit4(a: array[4, int] | array[4, Dim]): string =
+  &"[{a[0]}, {a[1]}, {a[2]}, {a[3]}]"
+
 proc storeLiteral(p: PolicyKind, v: int32): string =
   ## A Store-typed literal for clamp bounds and pad values.
   case p
@@ -241,6 +244,16 @@ proc emitModel*(g: Graph, p: Plan, outDir, stem: string, sourceHash = "",
   ## vendor kernel's preferred weight layout gets applied — at build time, once,
   ## rather than on the device every invocation. See `steadyc/backend.nim`.
   createDir(outDir)
+  if g.bound > 0:
+    # The arena is planned at the bound, which holds only if no buffer is
+    # larger at a shorter length
+    for t in g.tensors:
+      if t.dims.len == 0: continue
+      let most = t.elements.at(g.bound)
+      for n in 1 ..< g.bound:
+        if t.elements.at(n) > most:
+          raise newException(EmitError,
+            &"tensor '{t.name}' is larger at a length of {n} than at the bound, {g.bound}")
   let alias = resolveAliases(g)
   let policy = g.policy.policyName
   let storeDt = g.policy.storeType
@@ -279,10 +292,22 @@ const
     ## padded taps. A compile-time constant, so a benchmark can report MAC/s
     ## and a target-side budget check costs nothing.
 """
+  if g.bound > 0:
+    nimSrc.add &"  MaxLength* = {g.bound}\n"
+    nimSrc.add "    ## The longest length `invoke` takes. The arena and every size below\n"
+    nimSrc.add "    ## are for it; `TotalMacs` too, and `macs` gives them for another.\n"
   for i, t in g.inputs:
     nimSrc.add &"  Input{i}Elems* = {g.tensors[t].numElements}\n"
   for i, t in g.outputs:
     nimSrc.add &"  Output{i}Elems* = {g.tensors[t].numElements}\n"
+  # The real value an input or output stands for is scale * (q - zero point),
+  # as the C header says too; a program moving values between models needs it
+  for (port, ts) in [("Input", g.inputs), ("Output", g.outputs)]:
+    for i, t in ts:
+      let q = g.tensors[t].quant
+      if q.scales.len == 1:
+        nimSrc.add &"  {port}{i}Scale* = {q.scales[0]:.17e}\n" &
+                   &"  {port}{i}ZeroPoint* = {q.zeroAt(0)}'i32\n"
   if sourceHash.len > 0:
     nimSrc.add &"  SourceHash* = \"{sourceHash}\"\n"
   if backend.layoutTag.len > 0:
@@ -365,6 +390,7 @@ const
   # still tell the backend which op reads it.
   var curOp = -1
   var curKind = okReshape
+  var softmaxSyms: array[2, string]   # int16 softmax's tables, once per model
 
   proc bufExpr(t: int): string =
     let tt = g.tensors[t]
@@ -391,6 +417,19 @@ const
 
   proc constExpr(t: int): string =
     castConst(ensureConst(t), g.tensors[t].dtype)
+
+  proc D(t: int): seq[Dim] = g.tensors[t].dimsOf
+    ## A tensor's shape, in terms of the length if the model takes one
+
+  proc E(t: int): Dim = g.tensors[t].elements
+
+  proc paramsOf(rp: ResolvedParams, oi: int, op: Op): string =
+    ## A per-tensor op's requantization, its multiplier and shift in flash
+    let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
+      tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
+    let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
+      tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
+    paramsExpr(g, rp, multSym, shiftSym, false)
 
   proc srcExpr(t: int): string =
     ## Where an op reads an operand from: flash if it is constant, the arena
@@ -439,16 +478,16 @@ const
                     &"{constExpr(w)}, {constExpr(b)},\n    {prm}, " &
                     &"{wT.shape[0]}, {wT.shape[1]})\n"
       of okConv2d:
-        let xs = g.tensors[x].shape
-        let ys = g.tensors[y].shape
+        let xs = D(x)
+        let ys = D(y)
         opCalls.add &"  conv2d({policy}, {bufExpr(y)}, {bufExpr(x)}, " &
                     &"{constExpr(w)}, {constExpr(b)},\n    {prm},\n" &
                     &"    {xs[1]}, {xs[2]}, {xs[3]}, {ys[1]}, {ys[2]}, {ys[3]}, " &
                     &"{op.kH}, {op.kW}, {op.strideH}, {op.strideW}, " &
                     &"{op.padTop}, {op.padLeft}, {op.dilationH}, {op.dilationW}, {pv})\n"
       of okDepthwiseConv2d:
-        let xs = g.tensors[x].shape
-        let ys = g.tensors[y].shape
+        let xs = D(x)
+        let ys = D(y)
         opCalls.add &"  depthwiseConv2d({policy}, {bufExpr(y)}, {bufExpr(x)}, " &
                     &"{constExpr(w)}, {constExpr(b)},\n    {prm},\n" &
                     &"    {xs[1]}, {xs[2]}, {xs[3]}, {ys[1]}, {ys[2]}, " &
@@ -459,8 +498,8 @@ const
 
     of okMaxPool2d, okAvgPool2d:
       let x = op.inputs[0]
-      let xs = g.tensors[x].shape
-      let ys = g.tensors[y].shape
+      let xs = D(x)
+      let ys = D(y)
       let (lo, hi) = clampLiteral(g.policy, op.fused, g.tensors[y].quant)
       let fn = if op.kind == okMaxPool2d: "maxPool2d" else: "avgPool2d"
       opCalls.add &"  {fn}({policy}, {bufExpr(y)}, {bufExpr(x)},\n" &
@@ -468,44 +507,138 @@ const
                   &"{op.kH}, {op.kW}, {op.strideH}, {op.strideW}, " &
                   &"{op.padTop}, {op.padLeft}, {lo}, {hi})\n"
 
-    of okAdd:
+    of okAdd, okSub:
       let a = op.inputs[0]
       let b = op.inputs[1]
       let (rp, rescale) = resolveAddParams(g, g.tensors[a], g.tensors[b],
                                            g.tensors[y], op.fused)
-      let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
-        tableConst(crRequantMult, oi, op.kind, op.name, dtInt32, rp.mult))
-      let shiftSym = emitConst(cSym(g, &"s{oi}_", op.name),
-        tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
-      let prm = paramsExpr(g, rp, multSym, shiftSym, false)
-      opCalls.add &"  addElementwise({policy}, {bufExpr(y)}, {bufExpr(a)}, " &
-                  &"{bufExpr(b)},\n    {prm}, {g.tensors[y].numElements},\n" &
-                  &"    {rescale.aMult}'i32, {rescale.aShift}'i32, " &
+      let prm = paramsOf(rp, oi, op)
+      let ys = D(y)
+      if op.kind == okAdd and D(a) == ys and D(b) == ys:
+        opCalls.add &"  addElementwise({policy}, {bufExpr(y)}, {srcExpr(a)}, " &
+                    &"{srcExpr(b)},\n    {prm}, {E(y)},\n"
+      else:
+        # Broadcast, or a subtraction, which has only the general kernel
+        let fn = if op.kind == okAdd: "add4d" else: "sub4d"
+        opCalls.add &"  {fn}({policy}, {bufExpr(y)}, {srcExpr(a)}, {srcExpr(b)},\n" &
+                    &"    {prm},\n    {lit4(pad4(ys))}, " &
+                    &"{lit4(broadcastStrides(D(a), ys))}, " &
+                    &"{lit4(broadcastStrides(D(b), ys))},\n"
+      opCalls.add &"    {rescale.aMult}'i32, {rescale.aShift}'i32, " &
                   &"{rescale.bMult}'i32, {rescale.bShift}'i32, " &
                   &"{rescale.aOffset}'i32, {rescale.bOffset}'i32)\n"
+
+    of okMul:
+      let a = op.inputs[0]
+      let b = op.inputs[1]
+      let ys = D(y)
+      let prm = paramsOf(resolveMulParams(g.tensors[a], g.tensors[b], g.tensors[y], op.fused), oi, op)
+      opCalls.add &"  mul4d({policy}, {bufExpr(y)}, {srcExpr(a)}, {srcExpr(b)},\n" &
+                  &"    {prm},\n    {lit4(pad4(ys))}, " &
+                  &"{lit4(broadcastStrides(D(a), ys))}, " &
+                  &"{lit4(broadcastStrides(D(b), ys))})\n"
+
+    of okBatchMatmul:
+      let a = op.inputs[0]
+      let b = op.inputs[1]
+      let xs = D(a)
+      let ys = D(y)
+      let prm = paramsOf(resolveBatchMatmulParams(g.tensors[a], g.tensors[b], g.tensors[y]), oi, op)
+      let (rows, depth, cols) = (xs[^2], xs[^1], ys[^1])
+      let batches = E(y) div (rows * cols)
+      opCalls.add &"  batchMatmul({policy}, {bufExpr(y)}, {srcExpr(a)}, {srcExpr(b)},\n" &
+                  &"    {prm},\n    {batches}, {rows}, {depth}, {cols}, " &
+                  &"{rows * depth}, {depth * cols}, {op.adjY})\n"
+
+    of okTranspose:
+      let x = op.inputs[0]
+      let xs = D(x)
+      let ys = D(y)
+      let inStrides = strides4(xs)
+      var strides: array[4, Dim]
+      for d in 0 ..< 4:
+        # Output dimension d, padded to four, reads the input's perm[d]
+        let k = d - (4 - ys.len)
+        strides[d] = if k < 0: dim(0) else: inStrides[op.perm[k] + 4 - xs.len]
+      opCalls.add &"  copy4d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                  &"{lit4(pad4(ys))}, {lit4(strides)}, 0)\n"
+
+    of okGather:
+      let table = g.tensors[op.inputs[0]]
+      let ids = op.inputs[1]
+      opCalls.add &"  gather({policy}, {bufExpr(y)}, {constExpr(op.inputs[0])}, " &
+                  &"{bufExpr(ids)}, {E(ids)}, {table.shape[1]})\n"
+
+    of okRequantize:
+      let x = op.inputs[0]
+      let rp = resolveRequantizeParams(g.tensors[x], g.tensors[y])
+      opCalls.add &"  requantize({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                  &"{E(y)}, {rp.mult[0]}'i32, {rp.shift[0]}'i32, " &
+                  &"{g.tensors[x].quant.zeroAt(0)}'i32, {rp.outZeroPoint}'i32)\n"
+
+    of okAddBand:
+      # The ADD's rescaling, its operands in the order the file had them
+      let (a, x) = (op.inputs[0], op.inputs[1])
+      let (first, second) = if op.bandSide == 0: (x, a) else: (a, x)
+      let (rp, r) = resolveAddParams(g, g.tensors[first], g.tensors[second], g.tensors[y], op.fused)
+      let prm = paramsOf(rp, oi, op)
+      let (am, ash, ao, bm, bsh, bo) =
+        if op.bandSide == 0: (r.bMult, r.bShift, r.bOffset, r.aMult, r.aShift, r.aOffset)
+        else: (r.aMult, r.aShift, r.aOffset, r.bMult, r.bShift, r.bOffset)
+      let xs = D(x)
+      opCalls.add &"  addBand({policy}, {bufExpr(y)}, {srcExpr(a)}, {srcExpr(x)},\n    {prm},\n" &
+                  &"    {E(x) div (xs[^2] * xs[^1])}, {xs[^2]}, {xs[^1]}, {op.bandStart},\n" &
+                  &"    {am}'i32, {ash}'i32, {bm}'i32, {bsh}'i32, {ao}'i32, {bo}'i32)\n"
+
+    of okBand, okUnband:
+      let x = op.inputs[0]
+      let xs = D(x)
+      let n = xs[^2]
+      let w = if op.kind == okBand: xs[^1] else: D(y)[^1]
+      let fn = if op.kind == okBand: "band" else: "unband"
+      opCalls.add &"  {fn}({policy}, {bufExpr(y)}, {srcExpr(x)}, {E(x) div (n * xs[^1])}, " &
+                  &"{n}, {w}, {op.bandStart}, {storeLiteral(g.policy, g.tensors[x].quant.zeroAt(0))})\n"
+
+    of okRsqrt:
+      let x = op.inputs[0]
+      let lut = rsqrtLut16(float32(g.tensors[x].quant.scaleAt(0)),
+                           float32(g.tensors[y].quant.scaleAt(0)))
+      let sym = emitConst(cSym(g, &"lut{oi}_", op.name),
+        BackendConst(role: crLut, opIndex: oi, opKind: op.kind, name: op.name,
+                     dtype: dtInt16, shape: @[lut.len], data: fromInt16(lut)))
+      opCalls.add &"  lut16({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                  &"{E(y)}, {castConst(sym, dtInt16)})\n"
 
     of okClamp:
       let x = op.inputs[0]
       let (lo, hi) = clampLiteral(g.policy, op.fused, g.tensors[y].quant)
       opCalls.add &"  clamp1d({policy}, {bufExpr(y)}, {bufExpr(x)}, " &
-                  &"{g.tensors[y].numElements}, {lo}, {hi})\n"
+                  &"{E(y)}, {lo}, {hi})\n"
 
     of okPad:
       let x = op.inputs[0]
-      let xs = g.tensors[x].shape
+      let xs = D(x)
       let pv = storeLiteralF(g.policy, g.tensors[x].quant, op.padConst)
+      if g.policy == pkAffineI16x8:
+        var before = newSeq[Dim]()
+        for p in op.padsOf: before.add p[0]
+        opCalls.add &"  pad4d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                    &"{lit4(pad4(D(y)))}, {lit4(pad4(before, dim(0)))}, " &
+                    &"{lit4(pad4(xs))}, {pv})\n"
+        opChunks.add opCalls[mark .. ^1]
+        continue
       opCalls.add &"  pad2d({policy}, {bufExpr(y)}, {srcExpr(x)},\n" &
                   &"    {xs[1]}, {xs[2]}, {xs[3]}, " &
                   &"{op.pads[1][0]}, {op.pads[1][1]}, " &
                   &"{op.pads[2][0]}, {op.pads[2][1]}, {pv})\n"
 
     of okConcatenation:
-      let ys = g.tensors[y].shape
+      let ys = D(y)
       let ax = op.axis
-      var outer = 1
-      for d in 0 ..< ax: outer *= ys[d]
-      var innerOut = 1
-      for d in ax ..< ys.len: innerOut *= ys[d]
+      var outer = dim(1)
+      for d in 0 ..< ax: outer = outer * ys[d]
+      var innerOut = dim(1)
+      for d in ax ..< ys.len: innerOut = innerOut * ys[d]
 
       var ins: seq[Tensor]
       for t in op.inputs: ins.add g.tensors[t]
@@ -528,11 +661,11 @@ const
           tableConst(crRequantShift, oi, op.kind, op.name, dtInt32, rp.shift))
         prm = paramsExpr(g, rp, multSym, shiftSym, false)
 
-      var dstOff = 0
+      var dstOff = dim(0)
       for k, t in op.inputs:
-        let ts = g.tensors[t].shape
-        var innerIn = 1
-        for d in ax ..< ts.len: innerIn *= ts[d]
+        let ts = D(t)
+        var innerIn = dim(1)
+        for d in ax ..< ts.len: innerIn = innerIn * ts[d]
         if sameQuant(g.tensors[t].quant, g.tensors[y].quant):
           opCalls.add &"  concatSlice({policy}, {bufExpr(y)}, {srcExpr(t)}, " &
                       &"{outer}, {innerIn}, {innerOut}, {dstOff})\n"
@@ -542,12 +675,18 @@ const
                       &"{srcExpr(t)},\n    {prm},\n" &
                       &"    {outer}, {innerIn}, {innerOut}, {dstOff}, " &
                       &"{r.mult}'i32, {r.shift}'i32, {r.offset}'i32)\n"
-        dstOff += innerIn
+        dstOff = dstOff + innerIn
 
     of okMean:
       let x = op.inputs[0]
-      let xs = g.tensors[x].shape
-      let count = xs[1] * xs[2]
+      let xs = D(x)
+      if g.policy == pkAffineI16x8:
+        let prm = paramsOf(resolveMeanLastParams(g.tensors[x], g.tensors[y], xs[^1].value), oi, op)
+        opCalls.add &"  meanLastAxis({policy}, {bufExpr(y)}, {srcExpr(x)}, {prm}, " &
+                    &"{E(y)}, {xs[^1]})\n"
+        opChunks.add opCalls[mark .. ^1]
+        continue
+      let count = (xs[1] * xs[2]).value
       let (rp, corr) = resolveMeanParams(g, g.tensors[x], g.tensors[y], count,
                                          op.fused)
       let multSym = emitConst(cSym(g, &"m{oi}_", op.name),
@@ -562,11 +701,12 @@ const
     of okLogistic, okTanh:
       let x = op.inputs[0]
       if g.policy == pkAffineI16x8:
-        # No table of every input for 16 bits: TFLite's integer tanh, whose
-        # input scaling is worked out here.
-        let (mult, leftShift) = resolveTanhInt16Params(g.tensors[x])
-        opCalls.add &"  tanh16({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
-                    &"{g.tensors[y].numElements}, {mult}'i32, {leftShift}'i32)\n"
+        # No table of every input for 16 bits: TFLite's integer tanh and
+        # logistic, whose input scaling is worked out here.
+        let (mult, leftShift) = resolveTanhInt16Params(g.tensors[x], op.kind == okLogistic)
+        let fn = if op.kind == okLogistic: "logistic16" else: "tanh16"
+        opCalls.add &"  {fn}({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                    &"{E(y)}, {mult}'i32, {leftShift}'i32)\n"
         opChunks.add opCalls[mark .. ^1]
         continue
       # The activation is evaluated on the host at all 256 representable
@@ -577,13 +717,29 @@ const
         BackendConst(role: crLut, opIndex: oi, opKind: op.kind, name: op.name,
                      dtype: storeDt, shape: @[LutSize], data: lut))
       opCalls.add &"  lut1d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
-                  &"{g.tensors[y].numElements}, {castConst(sym, storeDt)})\n"
+                  &"{E(y)}, {castConst(sym, storeDt)})\n"
 
     of okSoftmax:
       let x = op.inputs[0]
-      let classes = g.tensors[x].shape[^1]
-      let rows = g.tensors[x].numElements div classes
-      let (tbl, bits) = buildExpLut(g.tensors[x].quant.scaleAt(0), classes)
+      let classes = D(x)[^1]
+      let rows = E(x) div classes
+      if g.policy == pkAffineI16x8:
+        # TFLite's two tables, which depend on nothing in the model, are shared
+        if softmaxSyms[0].len == 0:
+          let (e, r) = softmaxLuts16()
+          softmaxSyms[0] = emitConst(cSym(g, "softmax_exp", ""),
+            BackendConst(role: crLut, opIndex: oi, opKind: op.kind, name: "softmax_exp",
+                         dtype: dtInt16, shape: @[e.len], data: fromInt16(e)))
+          softmaxSyms[1] = emitConst(cSym(g, "softmax_reciprocal", ""),
+            BackendConst(role: crLut, opIndex: oi, opKind: op.kind, name: "softmax_reciprocal",
+                         dtype: dtInt16, shape: @[r.len], data: fromInt16(r)))
+        let (mult, shift) = resolveSoftmax16Params(g.tensors[x])
+        opCalls.add &"  softmax16({policy}, {bufExpr(y)}, {srcExpr(x)}, {rows}, {classes}, " &
+                    &"{castConst(softmaxSyms[0], dtInt16)}, {castConst(softmaxSyms[1], dtInt16)}, " &
+                    &"{mult}'i32, {shift}'i32)\n"
+        opChunks.add opCalls[mark .. ^1]
+        continue
+      let (tbl, bits) = buildExpLut(g.tensors[x].quant.scaleAt(0), classes.value)
       let sym = emitConst(cSym(g, &"exp{oi}_", op.name),
         tableConst(crExpTable, oi, op.kind, op.name, dtInt32, tbl))
       let rp = resolveSoftmaxParams(g, g.tensors[y])
@@ -598,14 +754,23 @@ const
       let x = op.inputs[0]
       let lp = resolveLeakyReluParams(g.tensors[x], g.tensors[y], op.alpha)
       opCalls.add &"  leakyRelu1d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
-                  &"{g.tensors[y].numElements},\n    {lp.inZero}'i32, {lp.outZero}'i32, " &
+                  &"{E(y)},\n    {lp.inZero}'i32, {lp.outZero}'i32, " &
                   &"{lp.identityMult}'i32, {lp.identityShift}'i32, " &
                   &"{lp.alphaMult}'i32, {lp.alphaShift}'i32)\n"
 
     of okSlice:
       let x = op.inputs[0]
-      let xs = g.tensors[x].shape
-      let ys = g.tensors[y].shape
+      let xs = D(x)
+      let ys = D(y)
+      if xs.len != 4 or op.begin[0] != 0:
+        # Not a crop of an image: walked along the input's strides
+        let st = strides4(xs)
+        var first = dim(0)
+        for d, b in op.beginOf: first = first + b * st[d + 4 - xs.len]
+        opCalls.add &"  copy4d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
+                    &"{lit4(pad4(ys))}, {lit4(st)}, {first})\n"
+        opChunks.add opCalls[mark .. ^1]
+        continue
       opCalls.add &"  slice2d({policy}, {bufExpr(y)}, {srcExpr(x)}, " &
                   &"{xs[2]}, {xs[3]}, {ys[1]}, {ys[2]}, {ys[3]}, " &
                   &"{op.begin[1]}, {op.begin[2]}, {op.begin[3]})\n"
@@ -631,6 +796,12 @@ template A(off: int, T: typedesc): ptr UncheckedArray[T] =
   cast[ptr UncheckedArray[T]](addr arena[off])
 
 """
+  if g.bound > 0:
+    var total = dim(0)
+    for op in g.ops: total = total + g.macDims(op)
+    nimSrc.add &"func macs*(n: int): int =\n" &
+               &"  ## Multiply-accumulates for a length of `n`, counted as `TotalMacs` is\n" &
+               &"  {total}\n\n"
 
   for i, t in g.inputs:
     let tt = g.tensors[t]
@@ -652,8 +823,14 @@ template A(off: int, T: typedesc): ptr UncheckedArray[T] =
                &"  ## Valid until the next invoke.\n" &
                &"  {bufExpr(t)}\n\n"
 
-  nimSrc.add "proc invoke*() =\n"
-  nimSrc.add "  ## Straight-line execution. No interpreter, no dispatch table.\n"
+  if g.bound > 0:
+    nimSrc.add "proc invoke*(n: int) =\n"
+    nimSrc.add "  ## Straight-line execution, for a length `n` from 1 to `MaxLength`. The\n"
+    nimSrc.add "  ## inputs hold their first `n` rows, and so do the outputs after.\n"
+    nimSrc.add "  doAssert n >= 1 and n <= MaxLength, \"the length is from 1 to MaxLength\"\n"
+  else:
+    nimSrc.add "proc invoke*() =\n"
+    nimSrc.add "  ## Straight-line execution. No interpreter, no dispatch table.\n"
   if opCalls.len == 0:
     nimSrc.add "  discard\n"
   else:
@@ -698,7 +875,8 @@ when defined(steadyProfile):
       let macs = if op.isPureAlias: 0 else: g.macCount(op)
       nimSrc.add &"      OpProfile(name: \"{op.name}\", kind: \"{op.kind}\", " &
                  &"macs: {macs}, outElems: {outElems}),\n"
-    nimSrc.add "    ]\n\n  proc invokeOp*(i: int) =\n    case i\n"
+    nimSrc.add "    ]\n\n  proc invokeOp*(" & (if g.bound > 0: "i, n: int" else: "i: int") &
+               ") =\n    case i\n"
     for oi, chunk in opChunks:
       nimSrc.add &"    of {oi}:\n"
       nimSrc.add reindent(chunk, 4)

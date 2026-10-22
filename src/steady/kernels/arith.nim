@@ -121,6 +121,23 @@ template lutIndex*(P: typedesc, v: untyped): untyped =
   ## and the host rejects the op rather than the kernel branching.
   viaArith(steady_arith.lutIndex(P, v), policy.lutIndex(P, v))
 
+template subRescaled*(P: typedesc, acc, v, mult, shift, offset: untyped) =
+  viaArith(steady_arith.subRescaled(P, acc, v, mult, shift, offset),
+           policy.subRescaled(P, acc, v, mult, shift, offset))
+
+template mulStores*(P: typedesc, a, b: untyped): untyped =
+  viaArith(steady_arith.mulStores(P, a, b), policy.mulStores(P, a, b))
+
+template zeroProduct*(P: typedesc): untyped =
+  ## The members for matmuls between two activations; see `ProductAccum`
+  viaArith(steady_arith.zeroProduct(P), policy.zeroProduct(P))
+
+template macStores*(P: typedesc, acc, a, b: untyped) =
+  viaArith(steady_arith.macStores(P, acc, a, b), policy.macStores(P, acc, a, b))
+
+template finishProduct*(P: typedesc, acc, prm: untyped): untyped =
+  viaArith(steady_arith.finishProduct(P, acc, prm), policy.finishProduct(P, acc, prm))
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BLOCK WIDTHS
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

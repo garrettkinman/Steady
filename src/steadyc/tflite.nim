@@ -28,7 +28,7 @@
 ##     data-dependent and cannot be folded on the host. Supporting them means a
 ##     runtime row-sum pass inside every matmul kernel. Convert to int8 instead.
 
-import std/[strformat, tables, sets, math, os]
+import std/[strformat, tables, sets, math, os, sequtils]
 import ./ir, ./flatbuffers
 from ./quant import fromInt32
 from ./emit import cIdent, nimIdentKey
@@ -68,6 +68,7 @@ const
   tsBuffer = 2
   tsName = 3
   tsQuantization = 4
+  tsShapeSignature = 7
 
   # table QuantizationParameters
   qpScale = 2
@@ -137,6 +138,27 @@ const
   # table ReducerOptions
   reducerKeepDims = 0
 
+  # table SubOptions
+  subFusedActivation = 0
+  subPotScaleInt16 = 1
+
+  # table MulOptions
+  mulFusedActivation = 0
+
+  # table BatchMatMulOptions
+  bmmAdjX = 0
+  bmmAdjY = 1
+
+  # table GatherOptions
+  gatherAxis = 0
+  gatherBatchDims = 1
+
+  # table PackOptions
+  packAxis = 1
+
+  # table ExpandDims has no options; SplitOptions
+  splitNumSplits = 0
+
   # enum Padding
   padSameCode = 0
   padValidCode = 1
@@ -176,6 +198,17 @@ const
   bopStridedSlice = 45
   bopLeakyRelu = 98
   bopQuantize = 114
+  bopMul = 18
+  bopGather = 36
+  bopTranspose = 39
+  bopSub = 41
+  bopSplit = 49
+  bopSlice = 65
+  bopRsqrt = 76
+  bopBatchMatmul = 126
+  bopShape = 77
+  bopPack = 83
+  bopExpandDims = 70
 
 func builtinName(code: int): string =
   ## For error messages only. Codes this importer does not map are reported by
@@ -201,6 +234,17 @@ func builtinName(code: int): string =
   of bopStridedSlice: "STRIDED_SLICE"
   of bopLeakyRelu: "LEAKY_RELU"
   of bopQuantize: "QUANTIZE"
+  of bopMul: "MUL"
+  of bopGather: "GATHER"
+  of bopTranspose: "TRANSPOSE"
+  of bopSub: "SUB"
+  of bopSplit: "SPLIT"
+  of bopSlice: "SLICE"
+  of bopRsqrt: "RSQRT"
+  of bopBatchMatmul: "BATCH_MATMUL"
+  of bopShape: "SHAPE"
+  of bopPack: "PACK"
+  of bopExpandDims: "EXPAND_DIMS"
   else: &"builtin #{code}"
 
 func dtypeOf(tt: int, where: string): DType =
@@ -248,6 +292,7 @@ func paddingOf(code: int, opName: string): Padding =
 type
   RawTensor = object
     shape: seq[int]
+    signature: seq[int]   ## -1 for a dimension left open
     typeCode: int
     bufferIdx: int
     name: string
@@ -332,6 +377,7 @@ proc readModel(bytes: sink seq[byte], path: string): Reader =
     let t = ts.tableAt(i)
     var raw = RawTensor(
       shape: t.fieldVector(tsShape).toIntSeq,
+      signature: (if t.has(tsShapeSignature): t.fieldVector(tsShapeSignature).toIntSeq else: @[]),
       typeCode: int(t.fieldI8(tsType)),
       bufferIdx: int(t.fieldU32(tsBuffer)),
       name: t.fieldString(tsName))
@@ -452,11 +498,258 @@ proc stripBoundary(r: var Reader): seq[bool] =
 
   for oi, op in r.ops:
     if result[oi]: continue
+    # A QUANTIZE from a store to the same store only rescales, which one
+    # policy can express: TFLite puts one before an operand of a
+    # concatenation whose scale is not the output's
+    if op.code == bopQuantize and
+       r.tensors[op.inputs[0]].typeCode == r.tensors[op.outputs[0]].typeCode:
+      continue
     if op.code in [bopQuantize, bopDequantize]:
       raise newException(TfliteError,
         &"operator {oi} is {builtinName(op.code)} in the middle of the graph, " &
         "not at its boundary; a storage-type change mid-graph is not " &
         "something one numeric policy can express")
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# A LENGTH LEFT OPEN
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# A model converted with a dimension left open writes it as -1 in its inputs'
+# shape signatures, and works its sizes out as it runs: SHAPE of a tensor,
+# arithmetic on that, PACK and CONCATENATION into the shape a RESHAPE takes or
+# the paddings a PAD does. Here that arithmetic is done once, on the host, in
+# terms of the length: every tensor's shape becomes a list of `Dim`s, and every
+# int32 tensor the arithmetic makes, its values as `Dim`s. The arithmetic's
+# own ops are then left out of the graph, and what read their results reads
+# the `Dim`s. One length, `n`, for a whole model: every open dimension of
+# every input is it.
+
+type SymValue = object
+  shape: seq[int]       ## Of the int32 tensor, which is fixed
+  vals: seq[Dim]
+
+proc isOpen(r: Reader): bool =
+  for t in r.graphInputs:
+    for d in r.tensors[t].signature[min(1, r.tensors[t].signature.len) .. ^1]:
+      if d < 0: return true
+
+proc isLengthOp(r: Reader, op: RawOp): bool =
+  ## An op of the length's arithmetic: its output is int32 and not the model's
+  op.outputs.len == 1 and r.tensors[op.outputs[0]].typeCode == ttInt32 and
+    op.outputs[0] notin r.graphOutputs
+
+proc inferLengths(r: Reader): tuple[shapes: Table[int, seq[Dim]],
+                                                   values: Table[int, SymValue]] =
+  var shapes = initTable[int, seq[Dim]]()
+  var values = initTable[int, SymValue]()
+  for ti, t in r.tensors:
+    if r.hasData(t.bufferIdx):
+      shapes[ti] = t.shape.mapIt(dim(it))
+      if t.typeCode == ttInt32:
+        let data = r.bufferBytes(t.bufferIdx)
+        var v = SymValue(shape: t.shape)
+        for i in 0 ..< data.len div 4:
+          var x: int32
+          copyMem(addr x, unsafeAddr data[i * 4], 4)
+          v.vals.add dim(int(x))
+        values[ti] = v
+  # What no op makes is an input, the file's own before a boundary QUANTIZE
+  # was taken away as well as the graph's
+  var produced = initHashSet[int]()
+  for op in r.ops:
+    for t in op.outputs: produced.incl t
+  for t in 0 ..< r.tensors.len:
+    if t in produced or t in shapes: continue
+    let sig = if r.tensors[t].signature.len > 0: r.tensors[t].signature else: r.tensors[t].shape
+    var ds: seq[Dim]
+    for i, d in sig:
+      ds.add(if i == 0: dim(1) elif d < 0: lengthDim() else: dim(d))
+    shapes[t] = ds
+
+  for oi, op in r.ops:
+    let nm = if op.outputs.len > 0: r.tensors[op.outputs[0]].name else: &"op{oi}"
+    proc fail(msg: string) =
+      raise newException(TfliteError, &"op '{nm}' ({builtinName(op.code)}): {msg}")
+    proc sh(k: int): seq[Dim] =
+      if op.inputs[k] notin shapes: fail(&"input {k}'s shape is not known")
+      shapes[op.inputs[k]]
+    proc vals(k: int): seq[Dim] =
+      if op.inputs[k] notin values: fail(&"input {k} is not worked out on the host")
+      values[op.inputs[k]].vals
+    proc ints(k: int): seq[int] =
+      for d in vals(k): result.add d.value
+    proc setVals(v: seq[Dim], shape: seq[int]) =
+      values[op.outputs[0]] = SymValue(shape: shape, vals: v)
+      shapes[op.outputs[0]] = shape.mapIt(dim(it))
+    proc setShape(k: int, ds: seq[Dim]) = shapes[op.outputs[k]] = ds
+    let length = r.isLengthOp(op)
+
+    case op.code
+    of bopShape:
+      let x = sh(0)
+      setVals(x, @[x.len])
+    of bopPack:
+      if op.optI(packAxis, 0) != 0: fail("only a PACK along axis 0 is worked out")
+      var v: seq[Dim]
+      for k in 0 ..< op.inputs.len: v.add vals(k)
+      setVals(v, @[op.inputs.len] & values[op.inputs[0]].shape)
+    of bopAdd, bopSub, bopMul:
+      if length:
+        let a = vals(0)
+        let b = vals(1)
+        if a.len != 1 and b.len != 1 and a.len != b.len: fail("operands of the length's arithmetic do not agree")
+        var v: seq[Dim]
+        for i in 0 ..< max(a.len, b.len):
+          let x = a[if a.len == 1: 0 else: i]
+          let y = b[if b.len == 1: 0 else: i]
+          v.add(case op.code
+                of bopAdd: x + y
+                of bopSub: x - y
+                else: x * y)
+        setVals(v, if a.len >= b.len: values[op.inputs[0]].shape else: values[op.inputs[1]].shape)
+      else:
+        let bs = block:
+          let a = sh(0)
+          let b = sh(1)
+          let n = max(a.len, b.len)
+          var o: seq[Dim]
+          for i in 0 ..< n:
+            let da = if i < n - a.len: dim(1) else: a[i - (n - a.len)]
+            let db = if i < n - b.len: dim(1) else: b[i - (n - b.len)]
+            if da == db or db == dim(1): o.add da
+            elif da == dim(1): o.add db
+            else: fail(&"{a} and {b} do not broadcast")
+          o
+        setShape(0, bs)
+    of bopConcatenation:
+      var axis = int(op.optI(catAxis, 0))
+      if length:
+        var v: seq[Dim]
+        for k in 0 ..< op.inputs.len: v.add vals(k)
+        setVals(v, @[v.len])
+      else:
+        var o = sh(0)
+        if axis < 0: axis += o.len
+        for k in 1 ..< op.inputs.len: o[axis] = o[axis] + sh(k)[axis]
+        setShape(0, o)
+    of bopReshape:
+      var target: seq[Dim]
+      if op.inputs.len > 1 and op.inputs[1] >= 0: target = vals(1)
+      else: target = r.tensors[op.outputs[0]].shape.mapIt(dim(it))
+      let total = if op.inputs[0] in values: dim(values[op.inputs[0]].vals.len) else: product(sh(0))
+      var known = dim(1)
+      var open = -1
+      for i, d in target:
+        if d == dim(-1): open = i else: known = known * d
+      if open >= 0: target[open] = total div known
+      if length: setVals(vals(0), target.mapIt(it.value))
+      else: setShape(0, target)
+    of bopExpandDims:
+      var o = sh(0)
+      var axis = ints(1)[0]
+      if axis < 0: axis += o.len + 1
+      o.insert(dim(1), axis)
+      if length: setVals(vals(0), o.mapIt(it.value)) else: setShape(0, o)
+    of bopStridedSlice:
+      let dims = if length: @[dim(values[op.inputs[0]].vals.len)] else: sh(0)
+      let first = vals(1)
+      let last = vals(2)
+      let strides = ints(3)
+      let beginMask = op.optI(ssBeginMask, 0)
+      let endMask = op.optI(ssEndMask, 0)
+      let shrink = op.optI(ssShrinkAxisMask, 0)
+      var o: seq[Dim]
+      var picked: seq[Dim]
+      for d in 0 ..< dims.len:
+        if d >= first.len:
+          o.add dims[d]
+          continue
+        if strides[d] != 1: fail("only a stride of 1 is worked out")
+        var b = if (beginMask shr d and 1) != 0: dim(0) else: first[d]
+        var e = if (endMask shr d and 1) != 0: dims[d] else: last[d]
+        if b.isConst and b.value < 0: b = dims[d] + b
+        if e.isConst and e.value < 0: e = dims[d] + e
+        if (shrink shr d and 1) != 0:
+          e = b + 1
+        else:
+          o.add e - b
+        if length:
+          if not b.isConst or not e.isConst: fail("a slice of the length's values has to be at fixed places")
+          picked = values[op.inputs[0]].vals[b.value ..< e.value]
+      if length: setVals(picked, o.mapIt(it.value))
+      else: setShape(0, o)
+    of bopSlice:
+      let x = sh(0)
+      let b = vals(1)
+      let size = vals(2)
+      var o: seq[Dim]
+      for d in 0 ..< x.len:
+        o.add(if size[d] == dim(-1): x[d] - b[d] else: size[d])
+      setShape(0, o)
+    of bopPad:
+      let x = sh(0)
+      let p = vals(1)
+      var o: seq[Dim]
+      for d in 0 ..< x.len: o.add x[d] + p[2 * d] + p[2 * d + 1]
+      setShape(0, o)
+    of bopTranspose:
+      let x = sh(0)
+      setShape(0, ints(1).mapIt(x[it]))
+    of bopConv2d:
+      let x = sh(0)
+      let w = sh(1)
+      let pad = paddingOf(op.optByte(convPadding, padSameCode), nm)
+      var o = @[x[0]]
+      for (d, stride, dil, k) in [(1, op.optI(convStrideH, 1), op.optI(convDilationH, 1), w[1]),
+                                  (2, op.optI(convStrideW, 1), op.optI(convDilationW, 1), w[2])]:
+        if not x[d].isConst and stride != 1: fail("a stride along the length is not worked out")
+        if x[d].isConst:
+          let kk = int(dil) * (k.value - 1) + 1
+          o.add dim(if pad == padValid: (x[d].value - kk + int(stride)) div int(stride)
+                    else: (x[d].value + int(stride) - 1) div int(stride))
+        else:
+          o.add(if pad == padValid: x[d] - int(dil) * (k.value - 1) else: x[d])
+      o.add w[0]
+      setShape(0, o)
+    of bopBatchMatmul:
+      let a = sh(0)
+      let b = sh(1)
+      let cols = if op.optBool(bmmAdjY, false): b[^2] else: b[^1]
+      setShape(0, a[0 ..< ^1] & @[cols])
+    of bopMean:
+      let x = sh(0)
+      var axes = ints(1)
+      for a in axes.mitems:
+        if a < 0: a += x.len
+      var o: seq[Dim]
+      for d in 0 ..< x.len:
+        if d in axes:
+          if op.optBool(reducerKeepDims, false): o.add dim(1)
+        else: o.add x[d]
+      setShape(0, o)
+    of bopGather:
+      setShape(0, sh(1) & sh(0)[1 .. ^1])
+    of bopSplit:
+      var axis = ints(0)[0]
+      let x = sh(1)
+      if axis < 0: axis += x.len
+      for k in 0 ..< op.outputs.len:
+        var o = x
+        o[axis] = x[axis] div dim(op.outputs.len)
+        setShape(k, o)
+    of bopQuantize, bopDequantize, bopTanh, bopLogistic, bopLeakyRelu, bopSoftmax,
+       bopRsqrt, bopRelu, bopRelu6, bopReluN1To1:
+      setShape(0, sh(0))
+    else:
+      fail("its output's shape is not worked out for a length left open")
+
+    # What the file knows of a shape, the inference has to agree with
+    for t in op.outputs:
+      let sig = r.tensors[t].signature
+      if t in shapes and sig.len == shapes[t].len:
+        for d, v in sig:
+          if v >= 0 and d > 0 and shapes[t][d] != dim(v):
+            fail(&"its output's dimension {d} is {v} in the file and {shapes[t][d]} here")
+  (shapes, values)
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # IMPORT
@@ -492,18 +785,42 @@ proc choosePolicy(r: Reader, keep: seq[bool]): PolicyKind =
       "the scales and zero points this compiler resolves at build time")
   raise newException(TfliteError, "the graph has no activations to compile")
 
-proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
-  ## Reads a TFLite flatbuffer into a validated `Graph`.
+proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>", bound = 0): Graph =
+  ## Reads a TFLite flatbuffer into a validated `Graph`. A model with a
+  ## length left open needs `bound`, the longest it will be given.
   var r = readModel(bytes, path)
   let skipped = stripBoundary(r)
   var keep = newSeq[bool](r.ops.len)
   for i in 0 ..< r.ops.len: keep[i] = not skipped[i]
+
+  let open = r.isOpen
+  if open and bound <= 0:
+    raise newException(TfliteError,
+      "the model leaves a length open (a -1 in an input's shape signature); " &
+      "give the longest it will be, as --bound")
+  if not open and bound > 0:
+    raise newException(TfliteError, "a bound was given, and the model leaves no length open")
+  var shapes: Table[int, seq[Dim]]
+  var values: Table[int, SymValue]
+  if open:
+    for oi, op in r.ops:
+      if r.isLengthOp(op): keep[oi] = false
+    (shapes, values) = inferLengths(r)
+
+  proc paramInts(ti: int, what: string): seq[int] =
+    ## An op's int32 parameter: a constant, or worked out from the length,
+    ## at the bound
+    if open and ti in values and not r.hasData(r.tensors[ti].bufferIdx):
+      values[ti].vals.mapIt(it.at(bound))
+    else:
+      r.constInts(ti, what)
 
   let policy = choosePolicy(r, keep)
   let modelName = if name.len > 0: name
                   elif r.subgraphName.len > 0: r.subgraphName
                   else: "model"
   var g = initGraph(modelName, policy)
+  g.bound = bound
 
   # ---- which tensors are parameters rather than operands -------------------
   # A reshape's shape, a pad's paddings and a mean's axes are constants in the
@@ -512,12 +829,14 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
   var isParam = initHashSet[int]()
   for oi, op in r.ops:
     if not keep[oi]: continue
-    if op.code in [bopReshape, bopPad, bopMean] and
+    if op.code in [bopReshape, bopPad, bopMean, bopTranspose, bopExpandDims] and
        op.inputs.len > 1 and op.inputs[1] >= 0:
       isParam.incl op.inputs[1]
-    if op.code == bopStridedSlice:
+    if op.code in [bopStridedSlice, bopSlice]:
       for t in op.inputs[1 .. ^1]:
         if t >= 0: isParam.incl t
+    if op.code == bopSplit:
+      isParam.incl op.inputs[0]
 
   var needed = initHashSet[int]()
   for oi, op in r.ops:
@@ -538,11 +857,17 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
     if ti notin needed: continue
     let t = r.tensors[ti]
     var shape = t.shape
+    if shape.len == 0 and r.hasData(t.bufferIdx):
+      shape = @[1]                      # a scalar constant, which broadcasts as [1]
     if shape.len == 0:
       raise newException(TfliteError,
         &"tensor '{t.name}' has no shape; dynamic shapes are out of scope")
     # A dynamic batch is written as 0 or -1 depending on the converter. Every
     # kernel here is batch-1 anyway, and `validate` is what enforces that.
+    var dims: seq[Dim]
+    if open and ti in shapes and shapes[ti].len > 0:
+      dims = shapes[ti]
+      shape = dims.mapIt(it.at(bound))
     if shape[0] <= 0: shape[0] = 1
     for d in 1 ..< shape.len:
       if shape[d] <= 0:
@@ -585,6 +910,8 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
       idx[ti] = g.addInput(uname, shape, dtype, quant)
     else:
       idx[ti] = g.addIntermediate(uname, shape, dtype, quant)
+    if dims.len > 0 and not dims.allIt(it.isConst):
+      g.tensors[idx[ti]].dims = dims
 
   proc ir(ti: int): int =
     if ti notin idx:
@@ -605,6 +932,21 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
     let nm = if op.outputs.len > 0 and r.tensors[op.outputs[0]].name.len > 0:
                r.tensors[op.outputs[0]].name
              else: &"op{oi}"
+    if op.code == bopSplit:
+      # One slice for each output, which is all a split along an axis is
+      let x = op.inputs[1]
+      var axis = paramInts(op.inputs[0], &"op '{nm}' axis")[0]
+      if axis < 0: axis += r.tensors[x].shape.len
+      if not g.tensors[ir(x)].dimsOf[axis].isConst:
+        raise newException(TfliteError, &"op '{nm}': a SPLIT along the length is not supported")
+      var at = 0
+      for k, o in op.outputs:
+        var begin = newSeq[int](r.tensors[x].shape.len)
+        begin[axis] = at
+        discard g.addOp Op(name: r.tensors[o].name, kind: okSlice, inputs: @[ir(x)],
+                           outputs: @[ir(o)], begin: begin)
+        at += g.tensors[ir(o)].shape[axis]
+      continue
     if op.outputs.len != 1:
       raise newException(TfliteError,
         &"op '{nm}' has {op.outputs.len} outputs; every operator this importer " &
@@ -679,7 +1021,7 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
       for t in op.inputs:
         built.inputs.add ir(t)
 
-    of bopReshape:
+    of bopReshape, bopExpandDims:
       built.kind = okReshape
       built.inputs = @[ir(op.inputs[0])]
 
@@ -688,12 +1030,16 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
       built.inputs = @[ir(op.inputs[0])]
       if op.inputs.len < 2:
         raise newException(TfliteError, &"op '{nm}': PAD needs a paddings tensor")
-      let flat = r.constInts(op.inputs[1], &"op '{nm}' paddings")
+      let flat = paramInts(op.inputs[1], &"op '{nm}' paddings")
       if flat.len mod 2 != 0:
         raise newException(TfliteError,
           &"op '{nm}': paddings has {flat.len} entries, which is not whole pairs")
       for i in 0 ..< flat.len div 2:
         built.pads.add [flat[i * 2], flat[i * 2 + 1]]
+      if open and op.inputs[1] in values:
+        let v = values[op.inputs[1]].vals
+        if not v.allIt(it.isConst):
+          for i in 0 ..< v.len div 2: built.padDims.add [v[i * 2], v[i * 2 + 1]]
       built.padConst = 0.0            # TFLite PAD is defined to pad with zero
 
     of bopMean:
@@ -701,7 +1047,7 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
       built.inputs = @[ir(op.inputs[0])]
       if op.inputs.len < 2:
         raise newException(TfliteError, &"op '{nm}': MEAN needs an axes tensor")
-      built.axes = r.constInts(op.inputs[1], &"op '{nm}' axes")
+      built.axes = paramInts(op.inputs[1], &"op '{nm}' axes")
       built.keepDims = op.optBool(reducerKeepDims, false)
 
     of bopLogistic, bopTanh:
@@ -760,6 +1106,58 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
             &"not give the output's {outDim}")
       built.begin = first
 
+    of bopSub:
+      built.kind = okSub
+      built.fused = fusedOf(op.optByte(subFusedActivation, actNone), nm)
+      built.potScaleInt16 = op.optBool(subPotScaleInt16, true)
+      built.inputs = @[ir(op.inputs[0]), ir(op.inputs[1])]
+
+    of bopMul:
+      built.kind = okMul
+      built.fused = fusedOf(op.optByte(mulFusedActivation, actNone), nm)
+      built.inputs = @[ir(op.inputs[0]), ir(op.inputs[1])]
+
+    of bopRsqrt:
+      built.kind = okRsqrt
+      built.inputs = @[ir(op.inputs[0])]
+
+    of bopBatchMatmul:
+      built.kind = okBatchMatmul
+      built.adjX = op.optBool(bmmAdjX, false)
+      built.adjY = op.optBool(bmmAdjY, false)
+      built.inputs = @[ir(op.inputs[0]), ir(op.inputs[1])]
+
+    of bopTranspose:
+      built.kind = okTranspose
+      built.perm = paramInts(op.inputs[1], &"op '{nm}' perm")
+      built.inputs = @[ir(op.inputs[0])]
+
+    of bopGather:
+      built.kind = okGather
+      if op.optI(gatherAxis, 0) != 0 or op.optI(gatherBatchDims, 0) != 0:
+        raise newException(TfliteError,
+          &"op '{nm}': only a GATHER of rows, axis 0 and no batch dimensions, is supported")
+      built.inputs = @[ir(op.inputs[0]), ir(op.inputs[1])]
+
+    of bopSlice:
+      built.kind = okSlice
+      built.inputs = @[ir(op.inputs[0])]
+      let dims = g.tensors[built.inputs[0]].shape
+      built.begin = paramInts(op.inputs[1], &"op '{nm}' begin")
+      let size = paramInts(op.inputs[2], &"op '{nm}' size")
+      if open and op.inputs[1] in values and not values[op.inputs[1]].vals.allIt(it.isConst):
+        built.beginDims = values[op.inputs[1]].vals
+      for d in 0 ..< dims.len:
+        let want = if size[d] < 0: dims[d] - built.begin[d] else: size[d]
+        if want != g.tensors[built.outputs[0]].shape[d]:
+          raise newException(TfliteError,
+            &"op '{nm}': a slice of {size} from {built.begin} does not give the output's shape")
+
+    of bopQuantize:
+      # Only one within a store reaches here; see `stripBoundary`
+      built.kind = okRequantize
+      built.inputs = @[ir(op.inputs[0])]
+
     of bopRelu, bopRelu6, bopReluN1To1:
       built.kind = okClamp
       built.fused =
@@ -780,9 +1178,16 @@ proc importTflite*(bytes: sink seq[byte], name = "", path = "<memory>"): Graph =
     g.markOutput ir(t)
 
   g.validate
+  if open:
+    # The shapes were checked at the bound; that they agree at other lengths
+    # is what says the arithmetic was worked out right
+    for n in [1, 2, 3, bound div 2]:
+      if n >= 1:
+        var at = g.atLength(n)
+        at.validate
   g
 
-proc importTfliteFile*(path: string, name = ""): Graph =
+proc importTfliteFile*(path: string, name = "", bound = 0): Graph =
   ## Reads and imports a `.tflite` file from disk.
   if not fileExists(path):
     raise newException(TfliteError, &"no such file: {path}")
@@ -791,4 +1196,4 @@ proc importTfliteFile*(path: string, name = ""): Graph =
   if content.len > 0:
     copyMem(addr bytes[0], unsafeAddr content[0], content.len)
   let stem = if name.len > 0: name else: path.splitFile.name
-  importTflite(bytes, stem, path)
+  importTflite(bytes, stem, path, bound)

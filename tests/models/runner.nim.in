@@ -45,8 +45,81 @@ proc trialsFor(nIn: int, count: int, inZero: int32, store: DType): seq[seq[int32
   for i in 0 ..< count:
     result.add lcg(97'u32 + uint32(i) * 7919'u32, nIn, lo, hi)
 
-proc gen(modelPath, ioPath: string, count: int) =
-  let g = importTfliteFile(modelPath)
+proc fileName(name: string): string
+
+proc idTrials(n, rows, count: int): seq[seq[int32]] =
+  ## Indices into a table of `rows`: its first row, its last, and draws
+  result.add constant(0, n)
+  result.add constant(int32(rows - 1), n)
+  for i in 0 ..< count + 1:
+    result.add lcg(193'u32 + uint32(i) * 7919'u32, n, 0, 65535).mapIt(it mod int32(rows))
+
+proc trialsOf(g: Graph, t: int, count: int): seq[seq[int32]] =
+  ## For one input: an int32 one indexes a table, whose size the gather that
+  ## reads it says; a store, its whole range
+  let tt = g.tensors[t]
+  if tt.dtype == dtInt32:
+    for op in g.ops:
+      if op.kind == okGather and op.inputs[1] == t:
+        return idTrials(tt.numElements, g.tensors[op.inputs[0]].shape[0], count)
+    quit &"FAIL: int32 input '{tt.name}' is not the indices of a gather", 1
+  let zero = if tt.quant.zeroPoints.len > 0: tt.quant.zeroPoints[0] else: 0'i32
+  trialsFor(tt.numElements, count, zero, tt.dtype)
+
+proc portLines(g: Graph): string =
+  for (key, ts) in [("input", g.inputs), ("output", g.outputs)]:
+    var names, sizes: seq[string]
+    for t in ts:
+      names.add fileName(g.tensors[t].name)
+      sizes.add $g.tensors[t].numElements
+    result.add &"{key}_names {names.join(\" \")}\n{key}_sizes {sizes.join(\" \")}\n"
+
+proc genBounded(g: Graph, modelPath, ioPath: string) =
+  ## A model taking a length: each trial at a length of its own, the first
+  ## short, as the per-tensor pass simulates it, then the ends of the range
+  let lengths = [min(37, g.bound), 1, 2, 5, g.bound div 2 + 1, g.bound]
+  var s = &"model {g.name}\npath {modelPath}\nbound {g.bound}\n" & portLines(g)
+  for k, n in lengths:
+    let at = g.atLength(n)
+    var line = &"trial {n}"
+    for t in at.inputs:
+      let draws = trialsOf(at, t, 1)
+      for v in draws[draws.high - k mod 2]: line.add " " & $v
+    s.add line & "\n"
+  writeFile(ioPath, s)
+  echo &"    {lengths.len} trials at lengths {lengths}, {g.inputs.len} inputs, {g.outputs.len} outputs"
+
+proc gen(modelPath, ioPath: string, count, bound: int) =
+  let g = importTfliteFile(modelPath, bound = bound)
+  if g.bound > 0:
+    genBounded(g, modelPath, ioPath)
+    return
+  if g.inputs.len > 1 or g.outputs.len > 1:
+    # Each trial is every input, in the graph's order, end to end; each
+    # reference every output. The names say which is which.
+    var s = &"model {g.name}\n"
+    var total = 0
+    for (key, ts) in [("input", g.inputs), ("output", g.outputs)]:
+      var names, sizes, stores: seq[string]
+      for t in ts:
+        names.add fileName(g.tensors[t].name)
+        sizes.add $g.tensors[t].numElements
+        stores.add $g.tensors[t].dtype
+      s.add &"{key}_names {names.join(\" \")}\n{key}_sizes {sizes.join(\" \")}\n" &
+            &"{key}_stores {stores.join(\" \")}\n"
+    for t in g.outputs: total += g.tensors[t].numElements
+    s.add &"outputs {total}\n"
+    var each: seq[seq[seq[int32]]]
+    for t in g.inputs: each.add trialsOf(g, t, count)
+    let n = min(each.mapIt(it.len))
+    for k in 0 ..< n:
+      var line = "trial"
+      for e in each:
+        for v in e[k]: line.add " " & $v
+      s.add line & "\n"
+    writeFile(ioPath, s)
+    echo &"    {n} trials, {g.inputs.len} inputs, {g.outputs.len} outputs"
+    return
   let inT = g.tensors[g.inputs[0]]
   let outT = g.tensors[g.outputs[0]]
   let inZero = if inT.quant.zeroPoints.len > 0: inT.quant.zeroPoints[0] else: 0'i32
@@ -84,8 +157,60 @@ proc readTrials(path: string): tuple[meta: seq[(string, string)], trials: seq[se
     else:
       result.meta.add (key, rest)
 
+template withPort(kind: untyped, k: int, p, body: untyped) =
+  ## The model's input or output `k`, as `p`, if it has one
+  when compiles(`kind 0`()):
+    if k == 0:
+      let p = `kind 0`()
+      body
+  when compiles(`kind 1`()):
+    if k == 1:
+      let p = `kind 1`()
+      body
+  when compiles(`kind 2`()):
+    if k == 2:
+      let p = `kind 2`()
+      body
+
+proc metaOf(io: tuple[meta: seq[(string, string)], trials: seq[seq[int32]]], key: string): string =
+  for (k, v) in io.meta:
+    if k == key: return v
+
+proc checkBounded(io, reference: tuple[meta: seq[(string, string)], trials: seq[seq[int32]]],
+                  tolerance: int) =
+  ## Each trial at its own length, through `invoke(n)`
+  let g = importTfliteFile(metaOf(io, "path"), bound = parseInt(metaOf(io, "bound")))
+  var worst = 0
+  var exact = 0
+  for i, trial in io.trials:
+    let n = int(trial[0])
+    let at = g.atLength(n)
+    var pos = 1
+    for k, t in at.inputs:
+      withPort(input, k, p):
+        for j in 0 ..< at.tensors[t].numElements: p[j] = typeof(p[0])(trial[pos + j])
+      pos += at.tensors[t].numElements
+    when compiles(model.invoke(1)): model.invoke(n)
+    var got: seq[int32]
+    for k, t in at.outputs:
+      withPort(output, k, p):
+        for j in 0 ..< at.tensors[t].numElements: got.add int32(p[j])
+    let want = reference.trials[i]
+    if want.len != got.len:
+      quit &"FAIL: at length {n} the reference has {want.len} values and the model {got.len}", 1
+    var d = 0
+    for j in 0 ..< got.len: d = max(d, abs(int(got[j]) - int(want[j])))
+    if d == 0: inc exact
+    worst = max(worst, d)
+  echo &"    {io.trials.len} trials at their own lengths  identical outputs {exact}/{io.trials.len}  max diff {worst}"
+  if worst > tolerance:
+    quit &"FAIL: max difference {worst} exceeds the tolerance of {tolerance}", 1
+
 proc check(ioPath, refPath: string, tolerance: int) =
   let io = readTrials(ioPath)
+  if metaOf(io, "bound").len > 0:
+    checkBounded(io, readTrials(refPath), tolerance)
+    return
   let reference = readTrials(refPath)
   var nOut = 0
   for (k, v) in io.meta:
@@ -99,11 +224,25 @@ proc check(ioPath, refPath: string, tolerance: int) =
   var top1 = 0
   var exact = 0
 
+  var sizes: seq[int]
+  for (k, v) in io.meta:
+    if k == "input_sizes": sizes = v.splitWhitespace.mapIt(parseInt(it))
+  if sizes.len == 0: sizes = @[io.trials[0].len]
+  var outSizes = @[nOut]
+  for (k, v) in io.meta:
+    if k == "output_sizes": outSizes = v.splitWhitespace.mapIt(parseInt(it))
+
   for i, input in io.trials:
-    let inp = model.input0()
-    for j, v in input: inp[j] = typeof(inp[0])(v)
-    model.invoke()
-    let outp = model.output0()
+    var at = 0
+    for k, n in sizes:
+      withPort(input, k, p):
+        for j in 0 ..< n: p[j] = typeof(p[0])(input[at + j])
+      at += n
+    when compiles(model.invoke()): model.invoke()
+    var outp: seq[int32]
+    for k, n in outSizes:
+      withPort(output, k, p):
+        for j in 0 ..< n: outp.add int32(p[j])
 
     let want = reference.trials[i]
     if want.len != nOut:
@@ -157,12 +296,20 @@ proc tensors(modelPath, ioPath, refPath: string) =
   ## MobileNetV2 channels where the two disagree, the exact real value is
   ## nearer our answer than theirs, because their float path mis-rounds just
   ## past a tie. See the note in tests/models/check.sh.
-  let g = importTfliteFile(modelPath)
   let io = readTrials(ioPath)
   if io.trials.len == 0: quit "FAIL: no trials", 1
+  let bound = metaOf(io, "bound")
+  # A model taking a length is simulated at the first trial's
+  let g = if bound.len > 0:
+            importTfliteFile(modelPath, bound = parseInt(bound)).atLength(int(io.trials[0][0]))
+          else: importTfliteFile(modelPath)
 
   var inputs = initTable[int, seq[int32]]()
-  inputs[g.inputs[0]] = io.trials[0]
+  var at = if bound.len > 0: 1 else: 0
+  for t in g.inputs:
+    let n = g.tensors[t].numElements
+    inputs[t] = io.trials[0][at ..< at + n]
+    at += n
   let bufs = simulate(g, inputs)
 
   var reference = initTable[string, seq[int32]]()
@@ -219,8 +366,8 @@ when isMainModule:
   if args.len < 1: quit "usage: runner gen|check ...", 1
   case args[0]
   of "gen":
-    if args.len < 4: quit "usage: runner gen <model.tflite> <io.txt> <trials>", 1
-    gen(args[1], args[2], parseInt(args[3]))
+    if args.len < 4: quit "usage: runner gen <model.tflite> <io.txt> <trials> [bound]", 1
+    gen(args[1], args[2], parseInt(args[3]), if args.len > 4: parseInt(args[4]) else: 0)
   of "check":
     if args.len < 4: quit "usage: runner check <io.txt> <ref.txt> <tolerance>", 1
     check(args[1], args[2], parseInt(args[3]))

@@ -70,9 +70,31 @@ proc operand(g: Graph, bufs: Buffers, t: int): seq[int32] =
     for i, e in v: result[i] = int32(e)
   of dtInt32:
     result = tt.asInt32
+  of dtInt16:
+    result = newSeq[int32](tt.numElements)
+    for i in 0 ..< tt.numElements:
+      var v: int16
+      copyMem(addr v, unsafeAddr tt.data[i * 2], 2)
+      result[i] = int32(v)
   else:
     raise newException(SimError,
       &"constant '{tt.name}' of dtype {tt.dtype} is not simulatable")
+
+proc unravel(i: int, shape: seq[int]): seq[int] =
+  ## The position of element `i` of a row-major tensor
+  result = newSeq[int](shape.len)
+  var r = i
+  for d in countdown(shape.high, 0):
+    result[d] = r mod shape[d]
+    r = r div shape[d]
+
+proc ravel(pos, shape: seq[int]): int =
+  ## Element of `shape` at `pos`, aligned from the right and taking each
+  ## dimension of 1 as broadcast: NumPy's rule, worked out here position by
+  ## position where the kernels walk strides
+  let skip = pos.len - shape.len
+  for d in 0 ..< shape.len:
+    result = result * shape[d] + (if shape[d] == 1: 0 else: pos[skip + d])
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -213,24 +235,142 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
             y[(oy * outW + ox) * ch + c] = max(lo, min(hi, v))
       result[op.outputs[0]] = y
 
-    of okAdd:
+    of okAdd, okSub:
       let aT = g.tensors[op.inputs[0]]
       let bT = g.tensors[op.inputs[1]]
-      let a = result[op.inputs[0]]
-      let b = result[op.inputs[1]]
+      let a = operand(g, result, op.inputs[0])
+      let b = operand(g, result, op.inputs[1])
       let (_, rescale) = resolveAddParams(g, aT, bT, outT, op.fused)
       let leftShift = addLeftShift(g.policy)
       let (om, osh) = quantizeMultiplier(
         (2.0 * max(aT.quant.scaleAt(0), bT.quant.scaleAt(0))) /
         (float64(1 shl leftShift) * outScale))
       var y = newSeq[int32](outT.numElements)
+      let same = aT.shape == bT.shape
       for i in 0 ..< outT.numElements:
+        let p = unravel(i, outT.shape)
+        let (ia, ib) = if same: (i, i) else: (ravel(p, aT.shape), ravel(p, bT.shape))
         let av = multiplyByQuantizedMultiplier(
-          (a[i] + rescale.aOffset) * (1'i32 shl leftShift), rescale.aMult, rescale.aShift)
+          (a[ia] + rescale.aOffset) * (1'i32 shl leftShift), rescale.aMult, rescale.aShift)
         let bv = multiplyByQuantizedMultiplier(
-          (b[i] + rescale.bOffset) * (1'i32 shl leftShift), rescale.bMult, rescale.bShift)
-        y[i] = actClamp(multiplyByQuantizedMultiplier(av + bv, om, osh) + outZero,
+          (b[ib] + rescale.bOffset) * (1'i32 shl leftShift), rescale.bMult, rescale.bShift)
+        let sum = if op.kind == okAdd: av + bv else: av - bv
+        y[i] = actClamp(multiplyByQuantizedMultiplier(sum, om, osh) + outZero,
                         op.fused, outT)
+      result[op.outputs[0]] = y
+
+    of okMul:
+      let aT = g.tensors[op.inputs[0]]
+      let bT = g.tensors[op.inputs[1]]
+      let a = operand(g, result, op.inputs[0])
+      let b = operand(g, result, op.inputs[1])
+      let (m, sh) = quantizeMultiplier(float64(float32(aT.quant.scaleAt(0)) *
+        float32(bT.quant.scaleAt(0)) / float32(outScale)))
+      var y = newSeq[int32](outT.numElements)
+      for i in 0 ..< y.len:
+        let p = unravel(i, outT.shape)
+        y[i] = actClamp(multiplyByQuantizedMultiplier(
+          a[ravel(p, aT.shape)] * b[ravel(p, bT.shape)], m, sh) + outZero, op.fused, outT)
+      result[op.outputs[0]] = y
+
+    of okBatchMatmul:
+      # Element by element from its position, in int64 as TFLite sums, and
+      # requantized from the full Q31 multiplier
+      let aT = g.tensors[op.inputs[0]]
+      let bT = g.tensors[op.inputs[1]]
+      let a = operand(g, result, op.inputs[0])
+      let b = operand(g, result, op.inputs[1])
+      let (m, sh) = quantizeMultiplier(float64(float32(aT.quant.scaleAt(0)) *
+        float32(bT.quant.scaleAt(0))) / outScale)
+      let depth = aT.shape[^1]
+      var y = newSeq[int32](outT.numElements)
+      for e in 0 ..< y.len:
+        var p = unravel(e, outT.shape)
+        let (i, j) = (p[^2], p[^1])
+        var acc = 0'i64
+        for k in 0 ..< depth:
+          p[^2] = i
+          p[^1] = k
+          let av = a[ravel(p, aT.shape)]
+          if op.adjY: (p[^2], p[^1]) = (j, k) else: (p[^2], p[^1]) = (k, j)
+          acc += int64(av) * int64(b[ravel(p, bT.shape)])
+        y[e] = actClamp(multiplyByQuantizedMultiplier64(acc, m, sh), faNone, outT)
+      result[op.outputs[0]] = y
+
+    of okTranspose:
+      let xT = g.tensors[op.inputs[0]]
+      let x = operand(g, result, op.inputs[0])
+      var y = newSeq[int32](outT.numElements)
+      for i in 0 ..< y.len:
+        let p = unravel(i, outT.shape)
+        var q = newSeq[int](p.len)
+        for d, src in op.perm: q[src] = p[d]
+        y[i] = x[ravel(q, xT.shape)]
+      result[op.outputs[0]] = y
+
+    of okGather:
+      let table = operand(g, result, op.inputs[0])
+      let ids = operand(g, result, op.inputs[1])
+      let inner = g.tensors[op.inputs[0]].shape[1]
+      var y = newSeq[int32]()
+      for id in ids:
+        y.add table[int(id) * inner ..< (int(id) + 1) * inner]
+      result[op.outputs[0]] = y
+
+    of okRequantize:
+      let xT = g.tensors[op.inputs[0]]
+      let x = operand(g, result, op.inputs[0])
+      let (m, sh) = quantizeMultiplier(xT.quant.scaleAt(0) / outScale)
+      var y = newSeq[int32](x.len)
+      for i in 0 ..< x.len:
+        y[i] = actClamp(multiplyByQuantizedMultiplier(x[i] - xT.quant.zeroAt(0), m, sh) +
+                        outZero, faNone, outT)
+      result[op.outputs[0]] = y
+
+    of okAddBand:
+      # The band's value at each position, then the ADD as above
+      let aT = g.tensors[op.inputs[0]]
+      let xT = g.tensors[op.inputs[1]]
+      let a = operand(g, result, op.inputs[0])
+      let x = operand(g, result, op.inputs[1])
+      let (first, second) = if op.bandSide == 0: (xT, aT) else: (aT, xT)
+      let (_, r) = resolveAddParams(g, first, second, outT, op.fused)
+      let leftShift = addLeftShift(g.policy)
+      let (om, osh) = quantizeMultiplier(
+        (2.0 * max(aT.quant.scaleAt(0), xT.quant.scaleAt(0))) / (float64(1 shl leftShift) * outScale))
+      var y = newSeq[int32](outT.numElements)
+      for e in 0 ..< y.len:
+        var p = unravel(e, outT.shape)
+        let k = p[^1] - p[^2] + op.bandStart
+        p[^1] = k
+        let band = if k >= 0 and k < xT.shape[^1]: x[ravel(p, xT.shape)] else: xT.quant.zeroAt(0)
+        let (u, v) = if op.bandSide == 0: (band, a[e]) else: (a[e], band)
+        let su = multiplyByQuantizedMultiplier((u + r.aOffset) * (1'i32 shl leftShift), r.aMult, r.aShift)
+        let sv = multiplyByQuantizedMultiplier((v + r.bOffset) * (1'i32 shl leftShift), r.bMult, r.bShift)
+        y[e] = actClamp(multiplyByQuantizedMultiplier(su + sv, om, osh) + outZero, op.fused, outT)
+      result[op.outputs[0]] = y
+
+    of okBand, okUnband:
+      # By position, from what each element of the five ops' result is
+      let xT = g.tensors[op.inputs[0]]
+      let x = operand(g, result, op.inputs[0])
+      let n = xT.shape[^2]
+      var y = newSeq[int32](outT.numElements)
+      for e in 0 ..< y.len:
+        var p = unravel(e, outT.shape)
+        let k = if op.kind == okBand: p[^1] - p[^2] + op.bandStart else: p[^2] + p[^1] - op.bandStart
+        let inside = k >= 0 and k < (if op.kind == okBand: xT.shape[^1] else: n)
+        p[^1] = k
+        y[e] = if inside: x[ravel(p, xT.shape)] else: xT.quant.zeroAt(0)
+      result[op.outputs[0]] = y
+
+    of okRsqrt:
+      # TFLite's table, as the runtime's: it is shared, as the int16 tanh's is
+      let x = operand(g, result, op.inputs[0])
+      var lut = rsqrtLut16(float32(g.tensors[op.inputs[0]].quant.scaleAt(0)), float32(outScale))
+      var y = newSeq[int32](x.len)
+      for i in 0 ..< x.len:
+        y[i] = int32(lutLookup16(int16(x[i]), cast[ptr UncheckedArray[int16]](addr lut[0])))
       result[op.outputs[0]] = y
 
     of okClamp:
@@ -246,6 +386,16 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
     of okPad:
       let xT = g.tensors[op.inputs[0]]
       let x = operand(g, result, op.inputs[0])
+      if g.policy == pkAffineI16x8:
+        # Scattered from each input position, of any dimensions
+        var y = newSeq[int32](outT.numElements)
+        for i in 0 ..< y.len: y[i] = quantizedValue(g.policy, xT.quant, op.padConst)
+        for i in 0 ..< x.len:
+          var p = unravel(i, xT.shape)
+          for d in 0 ..< p.len: p[d] += op.pads[d][0]
+          y[ravel(p, outT.shape)] = x[i]
+        result[op.outputs[0]] = y
+        continue
       let inH = xT.shape[1]
       let inW = xT.shape[2]
       let ch = xT.shape[3]
@@ -302,6 +452,18 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
       let xT = g.tensors[op.inputs[0]]
       let (inScale, inZero) = getQ(xT)
       let x = operand(g, result, op.inputs[0])
+      if g.policy == pkAffineI16x8:
+        # Each row summed, and TFLite's integer division in the multiplier
+        let n = xT.shape[^1]
+        let rp = resolveMeanLastParams(xT, outT, n)
+        var y = newSeq[int32](x.len div n)
+        for r in 0 ..< y.len:
+          var acc = 0'i32
+          for v in x[r * n ..< (r + 1) * n]: acc += v - inZero
+          y[r] = actClamp(multiplyByQuantizedMultiplier(acc, rp.mult[0], rp.shift[0]) + outZero,
+                          faNone, outT)
+        result[op.outputs[0]] = y
+        continue
       let ch = xT.shape[3]
       let count = xT.shape[1] * xT.shape[2]
       var y = newSeq[int32](ch)
@@ -325,9 +487,11 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
       if g.policy == pkAffineI16x8:
         # TFLite's own integer tanh, the only one for 16 bits; its arithmetic
         # is shared with the runtime, as requantization is.
-        let (mult, leftShift) = resolveTanhInt16Params(xT)
+        let (mult, leftShift) = resolveTanhInt16Params(xT, op.kind == okLogistic)
         var y = newSeq[int32](x.len)
-        for i in 0 ..< x.len: y[i] = int32(tanhInt16(int16(x[i]), mult, leftShift))
+        for i in 0 ..< x.len:
+          y[i] = int32(if op.kind == okLogistic: logisticInt16(int16(x[i]), mult, leftShift)
+                       else: tanhInt16(int16(x[i]), mult, leftShift))
         result[op.outputs[0]] = y
         continue
       let (inScale, inZero) = getQ(xT)
@@ -345,6 +509,32 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
       let xT = g.tensors[op.inputs[0]]
       let x = operand(g, result, op.inputs[0])
       let classes = xT.shape[^1]
+      if g.policy == pkAffineI16x8:
+        # TFLite's SoftmaxInt16, as written there, from the tables it makes
+        var (expLut, recipLut) = softmaxLuts16()
+        let ep = cast[ptr UncheckedArray[int16]](addr expLut[0])
+        let rcp = cast[ptr UncheckedArray[int16]](addr recipLut[0])
+        let (m, sh) = resolveSoftmax16Params(xT)
+        var y = newSeq[int32](x.len)
+        for r in 0 ..< x.len div classes:
+          let row = x[r * classes ..< (r + 1) * classes]
+          let mx = max(row)
+          var exps = newSeq[int32](classes)
+          var sum = 0'i32
+          for c, v in row:
+            let d = clamp(multiplyByQuantizedMultiplier(v - mx, m, sh) + 32767, -32768'i32, 32767'i32)
+            exps[c] = int32(lutLookup16(int16(d), ep))
+            sum += exps[c]
+          var headroom = 0'i32         # leading zeros, counted
+          while (uint32(sum) shl headroom) < 0x8000_0000'u32: inc headroom
+          let shifted = int32(((int64(sum) shl (headroom - 1)) + (1 shl 13)) shr 14)
+          let recip = int64(lutLookup16(int16(clamp(shifted - 98304'i32, -32768'i32, 32767'i32)), rcp))
+          let rs = 31 - headroom
+          for c in 0 ..< classes:
+            y[r * classes + c] = clamp(int32((int64(exps[c]) * recip + (1'i64 shl (rs - 1))) shr rs),
+                                       0'i32, 32767'i32)
+        result[op.outputs[0]] = y
+        continue
       let rows = x.len div classes
       let (tbl, _) = buildExpLut(xT.quant.scaleAt(0), classes)
       let rp = resolveSoftmaxParams(g, outT)
@@ -383,6 +573,13 @@ proc simulate*(g: Graph, inputs: Table[int, seq[int32]]): Buffers =
       let ys = outT.shape
       let xs = xT.shape
       var y = newSeq[int32](outT.numElements)
+      if xs.len != 4 or op.begin[0] != 0:
+        for i in 0 ..< y.len:
+          var p = unravel(i, ys)
+          for d in 0 ..< p.len: p[d] += op.begin[d]
+          y[i] = x[ravel(p, xs)]
+        result[op.outputs[0]] = y
+        continue
       var o = 0
       for h in 0 ..< ys[1]:
         for w in 0 ..< ys[2]:

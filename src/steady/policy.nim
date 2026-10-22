@@ -131,6 +131,10 @@ func finishRescaled*(_: typedesc[AffineI16x8], acc: int32, prm: AffineParams): i
   if v > prm.actMax: v = prm.actMax
   int16(v)
 
+template accumulate*(_: typedesc[AffineI16x8], acc: var int32, v: int16) =
+  ## Widen and add, for a mean. TFLite's int16 MEAN sums in an int32 too.
+  acc = acc + int32(v)
+
 func addRescaled*(_: typedesc[AffineI16x8], acc: var int32, v: int16,
                   mult, shift, offset: int32) {.inline.} =
   ## As for `AffineI8`, with TFLite's left shift for 16 bits, 15: two
@@ -138,3 +142,28 @@ func addRescaled*(_: typedesc[AffineI16x8], acc: var int32, v: int16,
   const AddLeftShift = 15'i32
   let shifted = (int32(v) + offset) * (1'i32 shl AddLeftShift)
   acc = acc + multiplyByQuantizedMultiplier(shifted, mult, shift)
+
+template subRescaled*(_: typedesc[AffineI16x8], acc: var int32, v: int16,
+                      mult, shift, offset: int32) =
+  ## `addRescaled`'s operand taken away rather than added, as TFLite's SUB
+  ## does: rounding the negation would not be negating the rounding.
+  const SubLeftShift = 15'i32
+  let shifted = (int32(v) + offset) * (1'i32 shl SubLeftShift)
+  acc = acc - multiplyByQuantizedMultiplier(shifted, mult, shift)
+
+template mulStores*(_: typedesc[AffineI16x8], a, b: int16): int32 =
+  ## Two stored values multiplied, for an elementwise MUL. Zero points are 0,
+  ## and two int16 multiply to within an int32.
+  int32(a) * int32(b)
+
+template zeroProduct*(_: typedesc[AffineI16x8]): int64 = 0'i64
+
+template macStores*(_: typedesc[AffineI16x8], acc: var int64, a, b: int16) =
+  acc = acc + int64(a) * int64(b)
+
+func finishProduct*(_: typedesc[AffineI16x8], acc: int64, prm: AffineParams): int16 {.inline.} =
+  ## Through the 16-bit multiplier, as TFLite's int16 BATCH_MATMUL does.
+  var v = multiplyByReducedMultiplier64(acc, prm.mult[0], prm.shift[0])
+  if v < prm.actMin: v = prm.actMin
+  if v > prm.actMax: v = prm.actMax
+  int16(v)

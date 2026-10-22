@@ -26,6 +26,21 @@ finish(P, acc: Accum, prm: Params, ch: int) -> Store
 finishRescaled(P, acc: Accum, prm: Params) -> Store
 ```
 
+A policy that runs a matmul between two activations, as attention's are, has three more:
+
+```nim
+ProductAccum(P)
+zeroProduct(P) -> ProductAccum
+macStores(P, acc: var ProductAccum, a, b: Store)
+finishProduct(P, acc: ProductAccum, prm: Params) -> Store
+```
+
+`ProductAccum(P)` is int64 for `AffineI16x8`, as TFLite's sum is. Unlike a weight's, the range of
+an activation's products can't be checked on the host, so the int32 argument above doesn't carry
+over; a backend whose hardware has no 64-bit lanes is free to do otherwise if its answer is the same,
+as `steady-xtheadvector`'s is (32-bit sums that saturate, redone when they do, or the operand split
+into bytes). `subRescaled` and `mulStores` are SUB's and MUL's counterparts of `addRescaled`.
+
 Plus one member only 8-bit policies have: `lutIndex(P, v: Store) -> int`, the raw storage byte of a
 value. Its presence *is* the statement "this storage type has 256 values and the host can tabulate a
 function over it" — see [Non-linear activations](#non-linear-activations).
@@ -230,6 +245,45 @@ the mask was built as `1'i32 shl exponent` and an exponent of 31 does not fit an
 writes `1ll <<` for exactly this reason. A MobileNet channel whose weights are all but zero produces
 a multiplier that small. Any bounds-checked build trapped on it, and `-d:danger` only worked by
 accident of two's-complement wrapping.
+
+## A length given at run time
+
+A model converted with a dimension left open says so in its inputs' shape signatures, a `-1`, and
+works its sizes out as it runs: `Shape` of a tensor, arithmetic on that, `Pack` and `Concatenation`
+into the shape a `Reshape` takes or the paddings a `Pad` does. With `--bound N`, the importer does
+that arithmetic once, on the host, in terms of the length `n`: every tensor's shape becomes a list of
+`Dim`s, polynomials in `n` with integer coefficients ([src/steadyc/symbolic.nim](../src/steadyc/symbolic.nim)),
+and every int32 tensor the arithmetic makes, its values as `Dim`s. Those ops are then left out of the
+graph. One length serves a whole model: every open dimension of every input is it.
+
+Everything downstream is unchanged by this, because the graph keeps its integer shapes, evaluated
+at the bound, beside the `Dim`s. Validation, the simulator and the planner read the integers, and
+`atLength(g, n)` gives the graph at any other length, which is how the importer validates it again
+at 1, 2, 3 and half the bound, and how the harness simulates it. Only the emitter reads the `Dim`s,
+writing each as a Nim expression in `n`, so a fixed model's generated code is byte for byte what it
+was. The planner's offsets hold at every length if no buffer is larger at a shorter one than at the
+bound, which the emitter checks for every length from 1 to it.
+
+A length *produced* by the graph, as the frames a sentence's durations add up to, is not yet
+supported: TinyTTS's program works the frames out between two models.
+
+## Rewrites
+
+[src/steadyc/rewrite.nim](../src/steadyc/rewrite.nim) runs between importing and planning and
+replaces chains of ops a converter writes out step by step with the one op they amount to. Its first
+rewrites are relative-position attention's (Shaw et al., Transformer-XL, VITS), whose logits by
+relative position, a window either side of the diagonal, reach the scores through a skew: pad each
+row by the length, read the rows back one shorter, crop. That is five ops over tensors of `n^2`
+elements and more, for a result whose every element is a read at a known place; it becomes `Band`,
+and its inverse, for the weights, `Unband`. A `Band` read only by an `Add` becomes `AddBand`, the
+`Add` taking the window from the band's input and the band's zero point elsewhere, so the `n^2`
+band is never written. At 605 frames of TinyTTS's flow on a D1, the skew's ops took 1.0G cycles of
+6.4G; rewritten, the band, its inverse and the scores' `Add` together take 0.15G, with the vector
+backend.
+
+The rewrites only move values, so they are exact by construction. The harness confirms it on every
+model it runs: the generated code takes the rewritten graph, and the simulator, which every tensor
+is compared through, the graph as TFLite wrote it.
 
 ## The TFLite importer
 

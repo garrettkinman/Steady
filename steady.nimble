@@ -33,7 +33,7 @@ task gen, "Regenerate the example models into tests/generated":
 
 task test, "Run the full test suite":
   genTask()
-  for f in ["test_quant", "test_codec", "test_arena",
+  for f in ["test_quant", "test_codec", "test_arena", "test_symbolic",
             "test_backend", "test_tflite", "test_dispatch", "test_e2e"]:
     echo "\n=== " & f & " ==="
     exec "nim c -r --hints:off --path:src tests/" & f & ".nim"

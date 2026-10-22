@@ -80,10 +80,69 @@ def to_codes(values, dtype, scale, zero):
     raise SystemExit(f"unsupported interpreter output dtype {dtype}")
 
 
+def ports(interp, meta, key):
+    """A model's inputs or outputs in the order `io.txt` lists them, by name,
+    with how many values each holds"""
+    details = {d["name"]: d for d in (interp.get_input_details() if key == "input"
+                                      else interp.get_output_details())}
+    names = meta[f"{key}_names"].split()
+    sizes = [int(v) for v in meta[f"{key}_sizes"].split()]
+    return [(details[n], k) for n, k in zip(names, sizes)]
+
+
+def run_length(interp, meta, trial):
+    """One trial of a model taking a length: its first value the length,
+    every input's open dimension resized to it"""
+    n, q = int(trial[0]), trial[1:]
+    details = {d["name"]: d for d in interp.get_input_details()}
+    order = [details[name] for name in meta["input_names"].split()]
+    for d in order:
+        shape = [n if v < 0 else v for v in d["shape_signature"]]
+        interp.resize_tensor_input(d["index"], shape)
+    interp.allocate_tensors()
+    at = 0
+    details = {d["name"]: d for d in interp.get_input_details()}
+    for name in meta["input_names"].split():
+        d = details[name]
+        size = int(np.prod(d["shape"]))
+        interp.set_tensor(d["index"], q[at:at + size].astype(d["dtype"]).reshape(d["shape"]))
+        at += size
+    interp.invoke()
+    outs = {d["name"]: d for d in interp.get_output_details()}
+    return np.concatenate([interp.get_tensor(outs[name]["index"]).reshape(-1).astype(np.int32)
+                           for name in meta["output_names"].split()])
+
+
+def run_ports(interp, meta, q):
+    """One trial of a model with several inputs or outputs, whose values all
+    go in and come out as they are, integers at both ends"""
+    at = 0
+    for d, n in ports(interp, meta, "input"):
+        interp.set_tensor(d["index"], q[at:at + n].astype(d["dtype"]).reshape(d["shape"]))
+        at += n
+    interp.invoke()
+    return np.concatenate([interp.get_tensor(d["index"]).reshape(-1).astype(np.int32)
+                           for d, _ in ports(interp, meta, "output")])
+
+
 def mode_outputs(model_path, io_path, out_path):
     meta, trials = read_io(io_path)
     interp = make_interpreter(model_path)
     interp.allocate_tensors()
+    if "bound" in meta:
+        with open(out_path, "w") as f:
+            f.write("# reference kernels, each trial at its own length\n")
+            for q in trials:
+                f.write("trial " + " ".join(str(int(v)) for v in run_length(interp, meta, q)) + "\n")
+        print(f"    {len(trials)} reference outputs, at their own lengths")
+        return
+    if "input_names" in meta:
+        with open(out_path, "w") as f:
+            f.write("# reference kernels, several inputs and outputs\n")
+            for q in trials:
+                f.write("trial " + " ".join(str(int(v)) for v in run_ports(interp, meta, q)) + "\n")
+        print(f"    {len(trials)} reference outputs")
+        return
     inp = interp.get_input_details()[0]
     out = interp.get_output_details()[0]
 
@@ -108,9 +167,14 @@ def mode_tensors(model_path, io_path, out_path):
     meta, trials = read_io(io_path)
     interp = make_interpreter(model_path, all_tensors=True)
     interp.allocate_tensors()
-    inp = interp.get_input_details()[0]
-    feed(interp, inp, trials[0], float(meta["in_scale"]), int(meta["in_zero"]))
-    interp.invoke()
+    if "bound" in meta:
+        run_length(interp, meta, trials[0])
+    elif "input_names" in meta:
+        run_ports(interp, meta, trials[0])
+    else:
+        inp = interp.get_input_details()[0]
+        feed(interp, inp, trials[0], float(meta["in_scale"]), int(meta["in_zero"]))
+        interp.invoke()
 
     written = 0
     with open(out_path, "w") as f:

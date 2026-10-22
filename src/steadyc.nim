@@ -12,9 +12,9 @@
 ## `string` and exceptions freely. Keeping the two halves strictly separate
 ## is what lets the device-side code be as small as it is.
 
-import steadyc/[ir, quant, codec, arena, backend, emit, capi, sim, tflite]
+import steadyc/[ir, quant, codec, arena, backend, emit, capi, sim, tflite, rewrite]
 
-export ir, quant, codec, arena, backend, emit, capi, sim, tflite
+export ir, quant, codec, arena, backend, emit, capi, sim, tflite, rewrite
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # COMMAND-LINE DRIVER
@@ -35,6 +35,8 @@ Options:
   -o, --out:DIR      where to write the generated files (default: generated)
   -n, --name:NAME    model name and file stem (default: the file's base name)
       --align:N      arena alignment in bytes, a power of two (default: 8)
+      --bound:N      for a model that leaves a length open, the longest it
+                     will be given; the generated `invoke(n)` takes 1 to N
       --no-capi      skip the C header and static-library shim
       --dump         print the imported graph, one operator per line
   -q, --quiet        do not print the resource report
@@ -61,6 +63,7 @@ Emits <stem>.nim, <stem>_weights.c/.h and, unless --no-capi, <stem>.h plus
     outDir = "generated"
     stem = ""
     alignment = DefaultAlignment
+    bound = 0
     wantCApi = true
     wantDump = false
     quiet = false
@@ -76,6 +79,10 @@ Emits <stem>.nim, <stem>_weights.c/.h and, unless --no-capi, <stem>.h plus
     of "align":
       try: alignment = parseInt(val)
       except ValueError: fail &"--align needs an integer, got '{val}'"
+    of "bound":
+      try: bound = parseInt(val)
+      except ValueError: fail &"--bound needs an integer, got '{val}'"
+      if bound < 1: fail "--bound needs a length of at least 1"
     else: discard
 
   for kind, key, val in getopt(commandLineParams()):
@@ -92,7 +99,7 @@ Emits <stem>.nim, <stem>_weights.c/.h and, unless --no-capi, <stem>.h plus
       if pending.len > 0:
         fail &"--{pending} needs a value"
       case key
-      of "o", "out", "n", "name", "align":
+      of "o", "out", "n", "name", "align", "bound":
         if val.len > 0: takeValue(key, val) else: pending = key
       of "no-capi": wantCApi = false
       of "dump": wantDump = true
@@ -125,7 +132,7 @@ Emits <stem>.nim, <stem>_weights.c/.h and, unless --no-capi, <stem>.h plus
       copyMem(addr bytes[0], unsafeAddr content[0], content.len)
     let stamp = &"fnv1a64:{fnv1a64(bytes):016x}"
 
-    var g = importTflite(bytes, stem, modelPath)
+    var g = rewrite(importTflite(bytes, stem, modelPath, bound))
     let plan = planOne(g, alignment)
 
     if wantDump:

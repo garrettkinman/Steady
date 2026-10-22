@@ -69,6 +69,13 @@
 ##   finish(P, acc: Accum, prm: Params, ch: int) -> Store
 ##   finishRescaled(P, acc: Accum, prm: Params) -> Store
 ##
+## and, for a policy that runs matmuls between two activations,
+##
+##   ProductAccum(P)  typedesc   accumulator of Store x Store products
+##   zeroProduct(P)                 -> ProductAccum(P)
+##   macStores(P, acc: var ProductAccum, a, b: Store)
+##   finishProduct(P, acc: ProductAccum, prm: Params) -> Store
+##
 ## `finish` ends a matmul-family op and `finishRescaled` an elementwise one,
 ## whose operands `addRescaled` has brought to a common domain. They are the
 ## same arithmetic for `AffineI8` and not for `AffineI16x8`, where TFLite
@@ -151,6 +158,14 @@ template Weight*(_: typedesc[AffineI16x8]): typedesc = int8
 template Accum*(_: typedesc[AffineI16x8]): typedesc = int32
 template Bias*(_: typedesc[AffineI16x8]): typedesc = int32
 template Params*(_: typedesc[AffineI16x8]): typedesc = AffineParams
+
+## `ProductAccum(P)` sums products of two *stored* values, as a matmul between
+## two activations does (attention's Q times K, and its weights times V),
+## where `Accum(P)` sums a weight times a stored value. Two int16 values
+## multiply to 2^30, so a 16-bit store needs an int64 sum, as TFLite's has;
+## and unlike a weight's, its range cannot be checked on the host, as both
+## operands are only known at run time.
+template ProductAccum*(_: typedesc[AffineI16x8]): typedesc = int64
 
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # BLOCK WIDTHS
@@ -286,6 +301,13 @@ func multiplyByReducedMultiplier*(x, reduced, shift: int32): int32 {.inline.} =
   let total = 15'i32 - shift
   int32((int64(x) * int64(reduced) + (1'i64 shl (total - 1))) shr total)
 
+func multiplyByReducedMultiplier64*(x: int64, reduced, shift: int32): int32 {.inline.} =
+  ## The same for an int64 `x`, a sum of products of two stored values.
+  ## TFLite narrows the result to an int32 by its low 32 bits, without
+  ## saturating, so this does too.
+  let total = 15'i64 - int64(shift)
+  cast[int32](uint32((x * int64(reduced) + (1'i64 shl (total - 1))) shr total and 0xFFFF_FFFF'i64))
+
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 # INT16 TANH
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -344,5 +366,47 @@ func tanhInt16*(x: int16, inputMultiplier, inputLeftShift: int32): int16 =
   r = if input >= 0: r - (1'i32 shl 23) + (1'i32 shl 7)
       else: -r + (1'i32 shl 23) + (1'i32 shl 7) - 1
   int16(r shr 8)
+
+func logisticInt16*(x: int16, inputMultiplier, inputLeftShift: int32): int16 =
+  ## TFLite's reference int16 logistic, for an output scale of 2^-15: the
+  ## same table as `tanhInt16`, read at a quarter of the slope
+  var mult = inputMultiplier
+  var leftShift = inputLeftShift
+  if mult == 0:
+    mult = 3'i32 shl leftShift
+    leftShift = 0
+  let round = if leftShift > 0: 1'i32 shl (leftShift - 1) else: 0'i32
+  let input = (int32(x) * mult + round) shr leftShift
+  let magnitude = uint32(abs(input))
+  let hi = magnitude shr 9
+  var r: uint32
+  if hi >= 255:
+    r = 0x7FFF'u32 shl 10
+  else:
+    let a = uint32(sigmoidTableU16[hi])
+    let b = uint32(sigmoidTableU16[hi + 1])
+    r = (a shl 9) + (magnitude and 0x1FF) * (b - a)
+  r = if input >= 0: r + (1'u32 shl 9) else: (1'u32 shl 25) - r + (1'u32 shl 9) - 1
+  cast[int16](uint16((r shr 10) and 0xFFFF))
+
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# INT16 TABLES
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+# TFLite's other way of evaluating a function of a 16-bit value: 513 entries,
+# the top 9 bits of the input choosing two and the low 7 interpolating between
+# them. The host builds the table as TFLite does, from the function itself;
+# see `steadyc/codec.nim`.
+
+const Lut16Size* = 513
+
+func lutLookup16*(value: int16, lut: ptr UncheckedArray[int16]): int16 {.inline.} =
+  ## TFLite's LUTLookup for int16
+  let index = 256 + (int(value) shr 7)
+  let offset = int32(value) and 0x7f
+  let base = int32(lut[index])
+  # TFLite holds the slope in an int16 and the result is narrowed the same
+  # way, by its low bits; a steep table, 1/sqrt near 0, does wrap
+  let slope = int32(cast[int16](uint16((int32(lut[index + 1]) - base) and 0xFFFF)))
+  cast[int16](uint16((base + ((slope * offset + 64) shr 7)) and 0xFFFF))
 
 when hostOS == "any": {.pop.}

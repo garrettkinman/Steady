@@ -190,10 +190,37 @@ Implemented: `Conv2D`, `DepthwiseConv2D`, `FullyConnected`, `MaxPool2D`, `Averag
 `Mean` (over H and W, i.e. global average), `Logistic`, `Tanh`, `Softmax`, `LeakyReLU`, and
 `StridedSlice` with stride 1 (a crop, copied).
 
-Under `AffineI16x8` the set is what has been matched against TFLite so far: `Conv2D`, `Add`,
-`Reshape`, `LeakyReLU`, `StridedSlice` and `Tanh`, the rest refused by name. There, `Tanh` is TFLite's
-own integer one, an interpolated table of the sigmoid, since a 16-bit store has no table of every
-input; and the int32 accumulator, where TFLite's is int64, is checked layer by layer on the host.
+Under `AffineI16x8` the set is what has been matched against TFLite so far, the rest refused by name:
+`Conv2D`, `Add`, `Sub` and `Mul`, broadcasting as NumPy does, `Reshape`, `ExpandDims`, `Transpose`,
+`Pad`, `Slice` and `StridedSlice` (as copies), `Split`, `Concatenation`, `Gather`, `Mean` over the last
+axis, `Rsqrt`, `Softmax`, `Logistic`, `Tanh`, `LeakyReLU`, `BatchMatMul` between two activations, and
+a `Quantize` from int16 to int16, which only rescales. Tensors have up to four dimensions. That is
+enough for a transformer: TinyTTS's text encoder and its flow, relative attention and a LayerNorm
+written out included. `Tanh` and `Logistic` are TFLite's own integer ones, an interpolated table of the
+sigmoid, since a 16-bit store has no table of every input; `Rsqrt` and `Softmax` read TFLite's other
+kind of table, 513 entries interpolated, which the host builds from the function as TFLite's Prepare
+does, in the precision it uses. The int32 accumulator of a convolution, where TFLite's is int64, is
+checked layer by layer on the host; a matmul between activations, whose operands are not known until
+it runs, sums in `ProductAccum(P)`, int64. `FullyConnected` is not among them: TFLite's int16
+reference kernel requantizes it in double precision, and an exporter can write a matmul by a constant
+as a 1x1 convolution instead, whose 16-bit kernel is fixed point.
+
+**A length given at run time.** A model converted with a dimension left open, a sentence's frames or
+phones, is compiled with `steadyc --bound N`. Every size in it is then a polynomial in the length `n`
+(attention's scores are `2n^2`; the relative-position skew reshapes through `n(n + 9)`), which the
+importer works out on the host, the model's own arithmetic on its shapes (`Shape`, `Pack`, int32
+`StridedSlice`, `Add`, `Mul`, `Concatenation`) included, and leaves out of the graph. The arena is
+planned at the bound, after checking that no buffer is larger at any shorter length; the generated
+module has `MaxLength`, `invoke(n)` for `n` from 1 to it, and `macs(n)`. RAM is known at compile time,
+as before, and the work follows the sentence.
+
+**Rewrites.** Between importing and planning, `steadyc` replaces chains of ops it recognises with the
+one op they amount to. The first are relative-position attention's: the skew that moves a window of
+logits onto the scores' diagonal, five ops over tensors of `n^2` and more, becomes one that reads each
+value from its place, and when the scores' `Add` is all that reads it, that `Add` takes the window
+directly, its `n^2` band never written. Values are moved and never changed, so the rewrite is exact by
+construction; the harness checks it is, running the generated code on the rewritten graph and the
+simulator on the one TFLite wrote.
 
 `Logistic` and `Tanh` are lookup tables the host builds by evaluating the true function at all 256
 representable inputs, so the device does a load rather than arithmetic — no libm, no software float,
@@ -203,8 +230,9 @@ gets a compile-time rejection naming the op. `Softmax` normalises over the last 
 one call covers both a classifier's single vector and a detector's grid — FOMO's output is 144
 independent 3-class distributions.
 
-Other deliberate limits, each a host-side error naming the op rather than a wrong answer: `Pad` is
-spatial only, `Mean` reduces H and W only, `Add` does not broadcast, batch is always 1. The bias is
+Other deliberate limits, each a host-side error naming the op rather than a wrong answer: under
+`AffineI8`, `Pad` is spatial only, `Mean` reduces H and W only and `Add` does not broadcast; batch is
+always 1. The bias is
 toward doing a small set completely rather than a large set approximately.
 
 ## Verification
@@ -244,8 +272,12 @@ rather than to a model.
 | `ad` | ten stacked fully-connected layers | 1 LSB per layer |
 | `person_detect` | MobileNetV1 0.25; compiles, but modern TFLite refuses to load it | compile only |
 | `tinytts_decoder` | TinyTTS's decoder for one chunk: int16 activations, dilated 1xk convolutions, LeakyReLU, crops, 16-bit tanh | every tensor exact |
+| `tinytts_encoder` | TinyTTS's text encoder and duration predictor, 64 phones: three gathers from int32 inputs, relative attention, LayerNorm, two outputs | every tensor exact |
+| `tinytts_flow` | its flow in reverse, 64 frames: twelve layers of attention, `BatchMatMul`, int16 softmax, broadcasting | every tensor exact |
+| `tinytts_encoder_open`, `tinytts_flow_open` | the same with the length left open, compiled with `--bound`, each trial at a length of its own from 1 to the bound | exact at every length |
+| `tinytts_g2p_encoder`, `tinytts_g2p_decoder` | g2p_en's GRU a step at a time, which spells a word for TinyTTS's front: int16 logistic | every tensor exact |
 
-`tinytts_decoder` is not published; the TinyTTS demo's export writes it, to be copied into
+The TinyTTS models are not published; the TinyTTS demo's export writes them, to be copied into
 `tests/models/`.
 
 Both divergences have the same cause: desktop TFLite evaluates int8 `FULLY_CONNECTED` and its
@@ -495,6 +527,13 @@ Done:
       costs it 2x
 - [x] The portable kernel work that benchmark justified: up to 2.2x on a Cortex-M4, with the
       bit-exactness unchanged, digit for digit
+- [x] 16x8 operator coverage for a transformer: broadcasting `Add`, `Sub` and `Mul`, `BatchMatMul`
+      between activations through a policy member of its own, int16 `Softmax`, `Rsqrt`, `Mean` over
+      the last axis, `Transpose`, `Gather`, `Split`, `Logistic`, and tensors of up to four
+      dimensions; TinyTTS's front and its G2P's GRU through the harness, exact
+- [x] A length given at run time, bounded at compile time: `--bound`, sizes as polynomials in the
+      length, `invoke(n)`, checked against TFLite at lengths from 1 to the bound
+- [x] A rewrite stage, and its first rewrites, relative attention's skew and its inverse
 - [x] Memory-hierarchy work in the kernels, aimed at the part that needed it. Convolution walks a
       block of filters across the whole image rather than the whole filter tensor across each pixel,
       which puts the flash-resident operand in the reuse position: **1.30x on the RISC-V part** and
@@ -510,7 +549,7 @@ Next, roughly in order:
       a fused lookup table — the host can collapse `Logistic` followed by an elementwise `Mul` on
       the same operand into one 256-entry table, so a modern activation costs a load. Channel
       `Split`, nearest-neighbour `Resize`. Then wider `Pad` (channel padding), `Mean` over other
-      axes, broadcasting `Add`
+      axes, broadcasting `Add` under `AffineI8` too
 - [ ] **More models through the differential harness**, cheapest first: EfficientNet-lite0, which
       has no swish and no squeeze-excite and may compile unmodified today; MobileNetV3-small, which
       forces a second table activation and a broadcasting multiply; and YOLOv8n's backbone and neck,

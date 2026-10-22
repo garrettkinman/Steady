@@ -172,3 +172,78 @@ template softmax*(P: typedesc, y, x, rows, classes, expLut: untyped,
                                   outShift, outZeroPoint, actMin, actMax),
            reference.softmax(P, y, x, rows, classes, expLut, outMult, outShift,
                              outZeroPoint, actMin, actMax))
+
+template add4d*(P: typedesc, y, a, b, prm, dims, aStrides, bStrides: untyped,
+                aMult, aShift, bMult, bShift, aZero, bZero: untyped) =
+  dispatch(steady_backend.add4d(P, y, a, b, prm, dims, aStrides, bStrides,
+                                aMult, aShift, bMult, bShift, aZero, bZero),
+           reference.add4d(P, y, a, b, prm, dims, aStrides, bStrides,
+                           aMult, aShift, bMult, bShift, aZero, bZero))
+
+template sub4d*(P: typedesc, y, a, b, prm, dims, aStrides, bStrides: untyped,
+                aMult, aShift, bMult, bShift, aZero, bZero: untyped) =
+  dispatch(steady_backend.sub4d(P, y, a, b, prm, dims, aStrides, bStrides,
+                                aMult, aShift, bMult, bShift, aZero, bZero),
+           reference.sub4d(P, y, a, b, prm, dims, aStrides, bStrides,
+                           aMult, aShift, bMult, bShift, aZero, bZero))
+
+template mul4d*(P: typedesc, y, a, b, prm, dims, aStrides, bStrides: untyped) =
+  dispatch(steady_backend.mul4d(P, y, a, b, prm, dims, aStrides, bStrides),
+           reference.mul4d(P, y, a, b, prm, dims, aStrides, bStrides))
+
+template copy4d*(P: typedesc, y, x, dims, strides, first: untyped) =
+  dispatch(steady_backend.copy4d(P, y, x, dims, strides, first),
+           reference.copy4d(P, y, x, dims, strides, first))
+
+template pad4d*(P: typedesc, y, x, dims, before, inDims, padValue: untyped) =
+  dispatch(steady_backend.pad4d(P, y, x, dims, before, inDims, padValue),
+           reference.pad4d(P, y, x, dims, before, inDims, padValue))
+
+template gather*(P: typedesc, y, table, indices, n, inner: untyped) =
+  dispatch(steady_backend.gather(P, y, table, indices, n, inner),
+           reference.gather(P, y, table, indices, n, inner))
+
+template requantize*(P: typedesc, y, x, n, mult, shift, inZero, outZero: untyped) =
+  dispatch(steady_backend.requantize(P, y, x, n, mult, shift, inZero, outZero),
+           reference.requantize(P, y, x, n, mult, shift, inZero, outZero))
+
+template batchMatmul*(P: typedesc, y, a, b, prm, batches, rows, depth, cols,
+                      aBatchStride, bBatchStride, bTransposed: untyped) =
+  dispatch(steady_backend.batchMatmul(P, y, a, b, prm, batches, rows, depth, cols,
+                                      aBatchStride, bBatchStride, bTransposed),
+           reference.batchMatmul(P, y, a, b, prm, batches, rows, depth, cols,
+                                 aBatchStride, bBatchStride, bTransposed))
+
+template meanLastAxis*(P: typedesc, y, x, prm, rows, n: untyped) =
+  dispatch(steady_backend.meanLastAxis(P, y, x, prm, rows, n),
+           reference.meanLastAxis(P, y, x, prm, rows, n))
+
+template softmax16*(P: typedesc, y, x, rows, classes, expLut, reciprocalLut,
+                    inputMultiplier, inputLeftShift: untyped) =
+  dispatch(steady_backend.softmax16(P, y, x, rows, classes, expLut, reciprocalLut,
+                                    inputMultiplier, inputLeftShift),
+           reference.softmax16(P, y, x, rows, classes, expLut, reciprocalLut,
+                               inputMultiplier, inputLeftShift))
+
+template lut16*(P: typedesc, y, x, n, table: untyped) =
+  dispatch(steady_backend.lut16(P, y, x, n, table),
+           reference.lut16(P, y, x, n, table))
+
+template logistic16*(P: typedesc, y, x, n, inputMultiplier, inputLeftShift: untyped) =
+  dispatch(steady_backend.logistic16(P, y, x, n, inputMultiplier, inputLeftShift),
+           reference.logistic16(P, y, x, n, inputMultiplier, inputLeftShift))
+
+template band*(P: typedesc, y, x, batches, n, w, start, padValue: untyped) =
+  dispatch(steady_backend.band(P, y, x, batches, n, w, start, padValue),
+           reference.band(P, y, x, batches, n, w, start, padValue))
+
+template unband*(P: typedesc, y, x, batches, n, w, start, padValue: untyped) =
+  dispatch(steady_backend.unband(P, y, x, batches, n, w, start, padValue),
+           reference.unband(P, y, x, batches, n, w, start, padValue))
+
+template addBand*(P: typedesc, y, a, x, prm, batches, n, w, start: untyped,
+                  aMult, aShift, bMult, bShift, aZero, bZero: untyped) =
+  dispatch(steady_backend.addBand(P, y, a, x, prm, batches, n, w, start,
+                                  aMult, aShift, bMult, bShift, aZero, bZero),
+           reference.addBand(P, y, a, x, prm, batches, n, w, start,
+                             aMult, aShift, bMult, bShift, aZero, bZero))
